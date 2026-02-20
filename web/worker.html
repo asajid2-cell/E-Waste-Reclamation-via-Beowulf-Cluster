@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cluster MVP Worker</title>
+    <style>
+      :root {
+        --bg: #102542;
+        --card: #1f3b62;
+        --text: #edf2f4;
+        --muted: #c2d4e7;
+        --ok: #06d6a0;
+        --warn: #ffd166;
+        --error: #ef476f;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Segoe UI", Tahoma, sans-serif;
+        background: linear-gradient(130deg, #0b1f37, var(--bg) 50%, #1d3557);
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 720px;
+        margin: 1.2rem auto;
+        padding: 1rem;
+      }
+      .card {
+        background: color-mix(in srgb, var(--card) 85%, black);
+        border: 1px solid #45648d;
+        border-radius: 12px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+      }
+      h1 {
+        margin: 0 0 0.4rem 0;
+      }
+      .pill {
+        display: inline-block;
+        padding: 0.2rem 0.6rem;
+        border-radius: 999px;
+        font-weight: 700;
+      }
+      .connected {
+        background: color-mix(in srgb, var(--ok) 20%, transparent);
+        color: var(--ok);
+      }
+      .connecting {
+        background: color-mix(in srgb, var(--warn) 20%, transparent);
+        color: var(--warn);
+      }
+      .disconnected {
+        background: color-mix(in srgb, var(--error) 20%, transparent);
+        color: var(--error);
+      }
+      .mono {
+        font-family: Consolas, Menlo, monospace;
+      }
+      #log {
+        white-space: pre-wrap;
+        background: #0e1e35;
+        border-radius: 8px;
+        padding: 0.75rem;
+        max-height: 260px;
+        overflow-y: auto;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>Volunteer Worker</h1>
+        <p>
+          Status:
+          <span id="connState" class="pill connecting">connecting</span>
+        </p>
+        <p>Worker ID: <span class="mono" id="workerId"></span></p>
+        <p>Current Job: <span class="mono" id="currentJob">idle</span></p>
+      </div>
+
+      <div class="card">
+        <strong>Log</strong>
+        <div id="log"></div>
+      </div>
+    </div>
+
+    <script>
+      const WORKER_ID_KEY = "cluster_worker_id";
+      const MAX_RECONNECT_MS = 10_000;
+
+      const connStateEl = document.getElementById("connState");
+      const workerIdEl = document.getElementById("workerId");
+      const currentJobEl = document.getElementById("currentJob");
+      const logEl = document.getElementById("log");
+
+      let ws = null;
+      let reconnectDelay = 500;
+      let reconnectTimer = null;
+
+      function randomSuffix() {
+        return Math.random().toString(36).slice(2, 8);
+      }
+
+      function getWorkerId() {
+        let workerId = localStorage.getItem(WORKER_ID_KEY);
+        if (!workerId) {
+          workerId = `worker-${randomSuffix()}`;
+          localStorage.setItem(WORKER_ID_KEY, workerId);
+        }
+        return workerId;
+      }
+
+      const workerId = getWorkerId();
+      workerIdEl.textContent = workerId;
+
+      function appendLog(line) {
+        const timestamp = new Date().toLocaleTimeString();
+        logEl.textContent += `[${timestamp}] ${line}\n`;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function setConnectionState(state) {
+        connStateEl.textContent = state;
+        connStateEl.className = "pill";
+        connStateEl.classList.add(state);
+      }
+
+      function send(message) {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        ws.send(JSON.stringify(message));
+      }
+
+      function handleAssignMessage(message) {
+        const { jobId, payload } = message;
+        if (!jobId || !payload || !Number.isFinite(payload.a) || !Number.isFinite(payload.b)) {
+          appendLog("received malformed assignment");
+          send({ type: "error", workerId, jobId: jobId || "unknown", error: "Malformed assignment payload" });
+          return;
+        }
+
+        currentJobEl.textContent = jobId;
+        appendLog(`processing job ${jobId}: ${payload.a} + ${payload.b}`);
+
+        try {
+          const result = payload.a + payload.b;
+          send({ type: "result", workerId, jobId, result });
+          appendLog(`sent result for ${jobId}: ${result}`);
+          currentJobEl.textContent = "idle";
+          send({ type: "ready", workerId });
+        } catch (error) {
+          send({
+            type: "error",
+            workerId,
+            jobId,
+            error: error && error.message ? error.message : "Computation failure",
+          });
+          appendLog(`error while processing ${jobId}`);
+          currentJobEl.textContent = "idle";
+          send({ type: "ready", workerId });
+        }
+      }
+
+      function scheduleReconnect() {
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+        }
+        reconnectTimer = setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(Math.floor(reconnectDelay * 1.8), MAX_RECONNECT_MS);
+      }
+
+      function connect() {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          return;
+        }
+
+        setConnectionState("connecting");
+        const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+        const url = `${protocol}://${window.location.host}/ws/worker`;
+        ws = new WebSocket(url);
+
+        ws.addEventListener("open", () => {
+          reconnectDelay = 500;
+          setConnectionState("connected");
+          appendLog(`connected to ${url}`);
+          send({ type: "register", workerId });
+          send({ type: "ready", workerId });
+        });
+
+        ws.addEventListener("message", (event) => {
+          let message = null;
+          try {
+            message = JSON.parse(event.data);
+          } catch (_err) {
+            appendLog("received non-JSON message");
+            return;
+          }
+
+          if (!message || typeof message !== "object") {
+            return;
+          }
+
+          if (message.type === "assign") {
+            handleAssignMessage(message);
+            return;
+          }
+
+          if (message.type === "ack" && message.jobId) {
+            appendLog(`server acknowledged ${message.jobId}`);
+            return;
+          }
+
+          if (message.type === "error") {
+            appendLog(`server error: ${message.message || "unknown"}`);
+            return;
+          }
+        });
+
+        ws.addEventListener("close", () => {
+          setConnectionState("disconnected");
+          appendLog("disconnected; retrying...");
+          scheduleReconnect();
+        });
+
+        ws.addEventListener("error", () => {
+          setConnectionState("disconnected");
+          appendLog("socket error");
+          try {
+            ws.close();
+          } catch (_err) {
+            // Ignore close errors.
+          }
+        });
+      }
+
+      connect();
+    </script>
+  </body>
+</html>

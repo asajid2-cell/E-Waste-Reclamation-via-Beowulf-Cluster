@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cluster MVP Client</title>
+    <style>
+      :root {
+        --bg: #0b132b;
+        --card: #1c2541;
+        --text: #f8f9fa;
+        --muted: #b6c2d9;
+        --ok: #4cc9f0;
+        --warn: #f4a261;
+        --err: #ef476f;
+      }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", Tahoma, sans-serif;
+        color: var(--text);
+        background: radial-gradient(circle at 20% 10%, #223a5e, var(--bg) 50%);
+        min-height: 100vh;
+      }
+      .wrap {
+        max-width: 720px;
+        margin: 2rem auto;
+        padding: 1rem;
+      }
+      .card {
+        background: color-mix(in srgb, var(--card) 88%, black);
+        border: 1px solid #2d4268;
+        border-radius: 12px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+      }
+      h1 {
+        margin: 0 0 0.25rem 0;
+        font-size: 1.6rem;
+      }
+      p {
+        margin: 0.3rem 0;
+        color: var(--muted);
+      }
+      form {
+        display: grid;
+        grid-template-columns: 1fr 1fr auto;
+        gap: 0.6rem;
+      }
+      input,
+      button {
+        border-radius: 8px;
+        border: 1px solid #3e5889;
+        padding: 0.6rem 0.8rem;
+        font-size: 1rem;
+      }
+      input {
+        background: #0e1a35;
+        color: var(--text);
+      }
+      button {
+        background: var(--ok);
+        color: #001219;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
+      .mono {
+        font-family: Consolas, Menlo, monospace;
+      }
+      .line {
+        margin: 0.45rem 0;
+      }
+      .status-done {
+        color: #80ed99;
+      }
+      .status-failed {
+        color: var(--err);
+      }
+      .status-queued,
+      .status-running {
+        color: var(--warn);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>Cluster MVP Client</h1>
+        <p>Submit a+b jobs to connected browser volunteers on your LAN.</p>
+        <p class="line">Workers connected: <strong id="workerCount">0</strong></p>
+      </div>
+
+      <div class="card">
+        <form id="jobForm">
+          <input id="inputA" name="a" type="number" step="1" required placeholder="a (integer)" />
+          <input id="inputB" name="b" type="number" step="1" required placeholder="b (integer)" />
+          <button id="submitBtn" type="submit">Submit</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <p class="line">Job ID: <span class="mono" id="jobId">-</span></p>
+        <p class="line">Status: <strong id="status">idle</strong></p>
+        <p class="line">Result: <strong id="result">-</strong></p>
+        <p class="line">Error: <span id="error">-</span></p>
+      </div>
+    </div>
+
+    <script>
+      const form = document.getElementById("jobForm");
+      const inputA = document.getElementById("inputA");
+      const inputB = document.getElementById("inputB");
+      const submitBtn = document.getElementById("submitBtn");
+      const workerCountEl = document.getElementById("workerCount");
+      const jobIdEl = document.getElementById("jobId");
+      const statusEl = document.getElementById("status");
+      const resultEl = document.getElementById("result");
+      const errorEl = document.getElementById("error");
+
+      let currentJobId = null;
+      let pollTimer = null;
+
+      function setStatus(status) {
+        statusEl.textContent = status;
+        statusEl.className = "";
+        statusEl.classList.add(`status-${status}`);
+      }
+
+      async function fetchWorkerCount() {
+        try {
+          const response = await fetch("/api/workers");
+          if (!response.ok) return;
+          const data = await response.json();
+          workerCountEl.textContent = String(data.count);
+        } catch (_err) {
+          // Keep previous value.
+        }
+      }
+
+      async function pollJob(jobId) {
+        try {
+          const response = await fetch(`/api/jobs/${jobId}`);
+          if (!response.ok) {
+            throw new Error(`Failed to fetch job ${jobId}`);
+          }
+          const data = await response.json();
+          setStatus(data.status);
+          resultEl.textContent = data.result == null ? "-" : String(data.result);
+          errorEl.textContent = data.error == null ? "-" : data.error;
+
+          if (data.status === "done" || data.status === "failed") {
+            clearInterval(pollTimer);
+            pollTimer = null;
+            submitBtn.disabled = false;
+          }
+        } catch (err) {
+          errorEl.textContent = err.message;
+        }
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        submitBtn.disabled = true;
+        errorEl.textContent = "-";
+        resultEl.textContent = "-";
+        setStatus("queued");
+
+        const a = Number(inputA.value);
+        const b = Number(inputB.value);
+
+        try {
+          const response = await fetch("/api/jobs", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ a, b }),
+          });
+          const data = await response.json();
+          if (!response.ok) {
+            throw new Error(data.error || "Request failed.");
+          }
+          currentJobId = data.jobId;
+          jobIdEl.textContent = currentJobId;
+          setStatus(data.status);
+
+          if (pollTimer) {
+            clearInterval(pollTimer);
+          }
+          pollTimer = setInterval(() => {
+            pollJob(currentJobId);
+          }, 800);
+          pollJob(currentJobId);
+        } catch (err) {
+          setStatus("failed");
+          errorEl.textContent = err.message;
+          submitBtn.disabled = false;
+        }
+      });
+
+      fetchWorkerCount();
+      setInterval(fetchWorkerCount, 1500);
+    </script>
+  </body>
+</html>
