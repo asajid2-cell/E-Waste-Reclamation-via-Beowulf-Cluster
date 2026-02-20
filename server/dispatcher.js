@@ -32,10 +32,7 @@ function createDispatcher(store, log = console) {
         sendJson(worker.ws, {
           type: "assign",
           jobId: nextJob.jobId,
-          payload: {
-            a: nextJob.a,
-            b: nextJob.b,
-          },
+          payload: nextJob.task,
         });
       } catch (error) {
         log.error("Failed to send job assignment:", error.message);

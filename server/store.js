@@ -22,12 +22,11 @@ function createStore() {
     job.updatedAt = nowIso();
   }
 
-  function createJob(a, b) {
+  function createJob(task) {
     const jobId = randomUUID();
     const job = {
       jobId,
-      a,
-      b,
+      task,
       status: "queued",
       result: null,
       error: null,

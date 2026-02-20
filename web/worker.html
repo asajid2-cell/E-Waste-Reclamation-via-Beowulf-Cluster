@@ -1,9 +1,9 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Cluster MVP Worker</title>
+    <title>Cluster Worker</title>
     <style>
       :root {
         --bg: #102542;
@@ -22,7 +22,7 @@
         color: var(--text);
       }
       .wrap {
-        max-width: 720px;
+        max-width: 760px;
         margin: 1.2rem auto;
         padding: 1rem;
       }
@@ -57,6 +57,9 @@
       .mono {
         font-family: Consolas, Menlo, monospace;
       }
+      .err {
+        color: var(--error);
+      }
       #log {
         white-space: pre-wrap;
         background: #0e1e35;
@@ -78,6 +81,8 @@
         </p>
         <p>Worker ID: <span class="mono" id="workerId"></span></p>
         <p>Current Job: <span class="mono" id="currentJob">idle</span></p>
+        <p>Invite: <span id="inviteState" class="mono"></span></p>
+        <p id="inviteError" class="err"></p>
       </div>
 
       <div class="card">
@@ -89,15 +94,31 @@
     <script>
       const WORKER_ID_KEY = "cluster_worker_id";
       const MAX_RECONNECT_MS = 10_000;
+      const BASE_PATH = (() => {
+        const path = window.location.pathname.replace(/\/+$/, "");
+        if (path.endsWith("/worker")) {
+          return path.slice(0, -"/worker".length);
+        }
+        return "";
+      })();
+
+      function withBase(path) {
+        return `${BASE_PATH}${path}`;
+      }
 
       const connStateEl = document.getElementById("connState");
       const workerIdEl = document.getElementById("workerId");
       const currentJobEl = document.getElementById("currentJob");
+      const inviteStateEl = document.getElementById("inviteState");
+      const inviteErrorEl = document.getElementById("inviteError");
       const logEl = document.getElementById("log");
 
       let ws = null;
       let reconnectDelay = 500;
       let reconnectTimer = null;
+
+      const inviteToken = new URLSearchParams(window.location.search).get("invite") || "";
+      inviteStateEl.textContent = inviteToken ? "present" : "missing";
 
       function randomSuffix() {
         return Math.random().toString(36).slice(2, 8);
@@ -136,7 +157,7 @@
 
       function handleAssignMessage(message) {
         const { jobId, payload } = message;
-        if (!jobId || !payload || !Number.isFinite(payload.a) || !Number.isFinite(payload.b)) {
+        if (!jobId || !payload || payload.op !== "add" || !Number.isInteger(payload.a) || !Number.isInteger(payload.b)) {
           appendLog("received malformed assignment");
           send({ type: "error", workerId, jobId: jobId || "unknown", error: "Malformed assignment payload" });
           return;
@@ -173,13 +194,20 @@
       }
 
       function connect() {
+        if (!inviteToken) {
+          setConnectionState("disconnected");
+          inviteErrorEl.textContent = "Missing invite token. Ask the client owner for an invite URL.";
+          appendLog("cannot connect without invite token");
+          return;
+        }
+
         if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
           return;
         }
 
         setConnectionState("connecting");
         const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-        const url = `${protocol}://${window.location.host}/ws/worker`;
+        const url = `${protocol}://${window.location.host}${withBase("/ws/worker")}?invite=${encodeURIComponent(inviteToken)}`;
         ws = new WebSocket(url);
 
         ws.addEventListener("open", () => {
@@ -213,15 +241,24 @@
             return;
           }
 
+          if (message.type === "ack" && message.message === "registered") {
+            appendLog(`registered as ${message.workerId}`);
+            return;
+          }
+
           if (message.type === "error") {
             appendLog(`server error: ${message.message || "unknown"}`);
-            return;
           }
         });
 
-        ws.addEventListener("close", () => {
+        ws.addEventListener("close", (event) => {
           setConnectionState("disconnected");
-          appendLog("disconnected; retrying...");
+          if (event.code === 1008) {
+            appendLog(`disconnected (${event.code}); invite rejected or expired`);
+            inviteErrorEl.textContent = "Invite rejected or expired. Request a fresh invite URL.";
+            return;
+          }
+          appendLog(`disconnected (${event.code}); retrying...`);
           scheduleReconnect();
         });
 
