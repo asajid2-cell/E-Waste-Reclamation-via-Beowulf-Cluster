@@ -354,16 +354,22 @@ generate_signing_keypair_node() {
   node -e 'const {generateKeyPairSync}=require("crypto"); const k=generateKeyPairSync("rsa",{modulusLength:2048,publicKeyEncoding:{type:"spki",format:"der"},privateKeyEncoding:{type:"pkcs8",format:"der"}}); console.log("JOB_SIGNING_PRIVATE_KEY_B64="+k.privateKey.toString("base64")); console.log("JOB_SIGNING_PUBLIC_KEY_B64="+k.publicKey.toString("base64"));'
 }
 
-detect_host_nginx_site_conf() {
+collect_host_nginx_site_confs() {
   local domain_regex
   domain_regex="$(escape_regex "${DOMAIN}")"
   local nginx_candidates=()
-  mapfile -t nginx_candidates < <(grep -RlsE "server_name[[:space:]].*${domain_regex}" /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null || true)
+  mapfile -t nginx_candidates < <(
+    grep -RlsE "server_name[[:space:]].*${domain_regex}" \
+      /etc/nginx/sites-enabled \
+      /etc/nginx/sites-available \
+      /etc/nginx/conf.d \
+      2>/dev/null || true
+  )
   if [[ "${#nginx_candidates[@]}" -eq 0 ]]; then
     return 1
   fi
 
-  # Filter backup artifacts and prefer canonical files in sites-available.
+  # Filter backup artifacts and canonicalize paths.
   local filtered=()
   local candidate
   for candidate in "${nginx_candidates[@]}"; do
@@ -372,7 +378,7 @@ detect_host_nginx_site_conf() {
         continue
         ;;
     esac
-    if [[ -e "${candidate}" ]]; then
+    if [[ -f "${candidate}" ]]; then
       filtered+=("$(realpath "${candidate}")")
     fi
   done
@@ -390,14 +396,55 @@ detect_host_nginx_site_conf() {
     fi
   done
 
+  if [[ "${#unique[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  # Stable priority:
+  # 1) active enabled configs
+  # 2) conf.d configs
+  # 3) remaining sites-available configs
+  local prioritized=()
+  for candidate in "${unique[@]}"; do
+    if [[ "${candidate}" == /etc/nginx/sites-enabled/* ]]; then
+      prioritized+=("${candidate}")
+    fi
+  done
+  for candidate in "${unique[@]}"; do
+    if [[ "${candidate}" == /etc/nginx/conf.d/* ]]; then
+      prioritized+=("${candidate}")
+    fi
+  done
   for candidate in "${unique[@]}"; do
     if [[ "${candidate}" == /etc/nginx/sites-available/* ]]; then
-      printf '%s' "${candidate}"
-      return 0
+      prioritized+=("${candidate}")
     fi
   done
 
-  printf '%s' "${unique[0]}"
+  # Deduplicate after priority merge.
+  local final=()
+  seen=""
+  for candidate in "${prioritized[@]}"; do
+    if [[ "|${seen}|" != *"|${candidate}|"* ]]; then
+      final+=("${candidate}")
+      seen="${seen}|${candidate}"
+    fi
+  done
+
+  if [[ "${#final[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  printf '%s\n' "${final[@]}"
+}
+
+detect_host_nginx_site_conf() {
+  local first
+  first="$(collect_host_nginx_site_confs | head -n1 || true)"
+  if [[ -z "${first}" ]]; then
+    return 1
+  fi
+  printf '%s' "${first}"
 }
 
 ensure_nginx_include_in_domain_servers() {
@@ -1100,8 +1147,13 @@ mark_done "Enabled and started systemd service ${SERVICE_NAME}."
 
 effective_proxy_mode="${PROXY_MODE}"
 detected_host_nginx_conf="${NGINX_SITE_CONF}"
+detected_host_nginx_confs=()
 if [[ -z "${detected_host_nginx_conf}" ]]; then
-  detected_host_nginx_conf="$(detect_host_nginx_site_conf || true)"
+  mapfile -t detected_host_nginx_confs < <(collect_host_nginx_site_confs || true)
+  detected_host_nginx_conf="${detected_host_nginx_confs[0]:-}"
+else
+  detected_host_nginx_conf="$(realpath "${detected_host_nginx_conf}" 2>/dev/null || printf '%s' "${detected_host_nginx_conf}")"
+  detected_host_nginx_confs=("${detected_host_nginx_conf}")
 fi
 tls_listener_owner="$(detect_tls_listener_owner || true)"
 if [[ -n "${tls_listener_owner}" ]]; then
@@ -1177,13 +1229,9 @@ EOF
     mark_done "Created fallback nginx site ${NGINX_SITE_CONF}."
     mark_pending "Fallback nginx site is HTTP-only unless your existing TLS setup terminates elsewhere."
     created_fallback_nginx_conf="1"
+    detected_host_nginx_confs=("${NGINX_SITE_CONF}")
   elif [[ ! -f "${NGINX_SITE_CONF}" ]]; then
     fail "Nginx site config not found: ${NGINX_SITE_CONF}"
-  fi
-
-  if grep -Fq "include /etc/nginx/snippets/${SERVICE_NAME}.conf;" "${NGINX_SITE_CONF}"; then
-    sed -i "\|include /etc/nginx/snippets/${SERVICE_NAME}.conf;|d" "${NGINX_SITE_CONF}"
-    mark_note "Removed legacy snippet include from ${NGINX_SITE_CONF} to avoid duplicate /cluster locations."
   fi
 
   if [[ "${created_fallback_nginx_conf}" == "0" ]]; then
@@ -1212,9 +1260,33 @@ EOF
     mark_done "Wrote nginx snippet ${NGINX_SNIPPET}."
 
     include_line="include ${NGINX_SNIPPET};"
-    log "Ensuring nginx include is present in domain server blocks in ${NGINX_SITE_CONF}"
-    ensure_nginx_include_in_domain_servers "${NGINX_SITE_CONF}" "${include_line}"
-    mark_done "Ensured nginx include is configured for ${DOMAIN} server blocks in ${NGINX_SITE_CONF}."
+    if [[ "${#detected_host_nginx_confs[@]}" -eq 0 ]]; then
+      detected_host_nginx_confs=("${NGINX_SITE_CONF}")
+    fi
+
+    local_conf_count=0
+    for conf_path in "${detected_host_nginx_confs[@]}"; do
+      [[ -z "${conf_path}" ]] && continue
+      if [[ ! -f "${conf_path}" ]]; then
+        mark_pending "Detected nginx conf missing on disk: ${conf_path}"
+        continue
+      fi
+      if grep -Fq "include /etc/nginx/snippets/${SERVICE_NAME}.conf;" "${conf_path}"; then
+        sed -i "\|include /etc/nginx/snippets/${SERVICE_NAME}.conf;|d" "${conf_path}"
+      fi
+      log "Ensuring nginx include is present in domain server blocks in ${conf_path}"
+      if ensure_nginx_include_in_domain_servers "${conf_path}" "${include_line}"; then
+        local_conf_count=$((local_conf_count + 1))
+      else
+        mark_pending "Could not patch nginx config automatically: ${conf_path}"
+      fi
+    done
+    if (( local_conf_count > 0 )); then
+      mark_done "Ensured nginx include is configured for ${DOMAIN} server blocks in ${local_conf_count} nginx file(s)."
+      mark_note "Patched nginx files: ${detected_host_nginx_confs[*]}"
+    else
+      mark_pending "Did not patch any nginx files for ${DOMAIN}; verify server_name blocks exist in active config."
+    fi
   fi
 
   log "Testing and reloading nginx"
