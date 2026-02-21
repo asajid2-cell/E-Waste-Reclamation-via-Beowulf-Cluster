@@ -240,6 +240,75 @@ run_as_app() {
   runuser -u "${APP_USER}" -- bash -lc "$*"
 }
 
+cleanup_legacy_nginx_artifacts() {
+  local cleaned="0"
+
+  # Backup files in sites-enabled are loaded by nginx and often cause duplicate server/location conflicts.
+  while IFS= read -r bak_file; do
+    rm -f "${bak_file}"
+    cleaned="1"
+  done < <(find /etc/nginx/sites-enabled -maxdepth 1 -type f -name '*.bak*' 2>/dev/null || true)
+
+  # Remove legacy cluster snippet includes introduced by older setup versions.
+  while IFS= read -r conf_file; do
+    sed -i '\|include /etc/nginx/snippets/cluster-app.conf;|d' "${conf_file}"
+    cleaned="1"
+  done < <(grep -RIl "include /etc/nginx/snippets/cluster-app.conf;" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null || true)
+
+  if [[ -f /etc/nginx/snippets/cluster-app.conf ]]; then
+    rm -f /etc/nginx/snippets/cluster-app.conf
+    cleaned="1"
+  fi
+
+  if [[ "${cleaned}" == "1" ]]; then
+    mark_note "Cleaned legacy nginx artifacts (.bak files and old cluster-app snippet includes)."
+  fi
+}
+
+validate_signing_keypair() {
+  local private_b64="$1"
+  local public_b64="$2"
+
+  if [[ -z "${private_b64}" || -z "${public_b64}" ]]; then
+    return 1
+  fi
+
+  local tmp_priv
+  local tmp_pub
+  local tmp_derived
+  tmp_priv="$(mktemp)"
+  tmp_pub="$(mktemp)"
+  tmp_derived="$(mktemp)"
+
+  if ! printf '%s' "${private_b64}" | base64 -d >"${tmp_priv}" 2>/dev/null; then
+    rm -f "${tmp_priv}" "${tmp_pub}" "${tmp_derived}"
+    return 1
+  fi
+  if ! printf '%s' "${public_b64}" | base64 -d >"${tmp_pub}" 2>/dev/null; then
+    rm -f "${tmp_priv}" "${tmp_pub}" "${tmp_derived}"
+    return 1
+  fi
+  if ! openssl pkey -inform DER -in "${tmp_priv}" -pubout -outform DER -out "${tmp_derived}" >/dev/null 2>&1; then
+    rm -f "${tmp_priv}" "${tmp_pub}" "${tmp_derived}"
+    return 1
+  fi
+
+  local ok="1"
+  if ! cmp -s "${tmp_pub}" "${tmp_derived}"; then
+    ok="0"
+  fi
+  rm -f "${tmp_priv}" "${tmp_pub}" "${tmp_derived}"
+
+  if [[ "${ok}" == "1" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+generate_signing_keypair_node() {
+  node -e 'const {generateKeyPairSync}=require("crypto"); const k=generateKeyPairSync("rsa",{modulusLength:2048,publicKeyEncoding:{type:"spki",format:"der"},privateKeyEncoding:{type:"pkcs8",format:"der"}}); console.log("JOB_SIGNING_PRIVATE_KEY_B64="+k.privateKey.toString("base64")); console.log("JOB_SIGNING_PUBLIC_KEY_B64="+k.publicKey.toString("base64"));'
+}
+
 detect_host_nginx_site_conf() {
   local domain_regex
   domain_regex="$(escape_regex "${DOMAIN}")"
@@ -741,13 +810,20 @@ fi
 if is_missing_secret "${worker_invite_secret}"; then
   worker_invite_secret="$(openssl rand -hex 48)"
 fi
+read_generated_keypair() {
+  local output
+  output="$(generate_signing_keypair_node)"
+  job_signing_private_key_b64="$(printf '%s\n' "${output}" | awk -F= '/^JOB_SIGNING_PRIVATE_KEY_B64=/{print substr($0, index($0,"=")+1)}' | tail -n1)"
+  job_signing_public_key_b64="$(printf '%s\n' "${output}" | awk -F= '/^JOB_SIGNING_PUBLIC_KEY_B64=/{print substr($0, index($0,"=")+1)}' | tail -n1)"
+}
+
 if is_missing_secret "${job_signing_private_key_b64}" || is_missing_secret "${job_signing_public_key_b64}"; then
-  log "Generating RSA signing keypair for signed jobs"
-  job_signing_private_key_b64="$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -outform DER 2>/dev/null | base64 | tr -d '\n')"
-  job_signing_public_key_b64="$(
-    printf '%s' "${job_signing_private_key_b64}" | base64 -d | \
-      openssl pkey -inform DER -pubout -outform DER 2>/dev/null | base64 | tr -d '\n'
-  )"
+  log "Generating RSA signing keypair for signed jobs (Node crypto)"
+  read_generated_keypair
+elif ! validate_signing_keypair "${job_signing_private_key_b64}" "${job_signing_public_key_b64}"; then
+  log "Existing signing keypair is invalid/mismatched. Regenerating."
+  read_generated_keypair
+  mark_note "Signing keypair was regenerated because existing values failed validation."
 fi
 
 set_env_key "NODE_ENV" "production"
@@ -832,6 +908,9 @@ if [[ "${effective_proxy_mode}" == "auto" ]]; then
 fi
 mark_done "Proxy mode selected: ${effective_proxy_mode}."
 
+# Normalize old config state before writing/updating route rules.
+cleanup_legacy_nginx_artifacts
+
 if [[ "${effective_proxy_mode}" == "host-nginx" ]]; then
   created_fallback_nginx_conf="0"
   NGINX_SITE_CONF="${detected_host_nginx_conf}"
@@ -866,6 +945,11 @@ EOF
     created_fallback_nginx_conf="1"
   elif [[ ! -f "${NGINX_SITE_CONF}" ]]; then
     fail "Nginx site config not found: ${NGINX_SITE_CONF}"
+  fi
+
+  if grep -Fq "include /etc/nginx/snippets/${SERVICE_NAME}.conf;" "${NGINX_SITE_CONF}"; then
+    sed -i "\|include /etc/nginx/snippets/${SERVICE_NAME}.conf;|d" "${NGINX_SITE_CONF}"
+    mark_note "Removed legacy snippet include from ${NGINX_SITE_CONF} to avoid duplicate /cluster locations."
   fi
 
   if [[ "${created_fallback_nginx_conf}" == "0" ]]; then
@@ -943,6 +1027,10 @@ if systemctl is-active --quiet "${SERVICE_NAME}"; then
   mark_done "Service ${SERVICE_NAME} is active."
 else
   mark_pending "Service ${SERVICE_NAME} is not active."
+  service_error_snippet="$(journalctl -u "${SERVICE_NAME}" -n 20 --no-pager 2>/dev/null | tail -n 6 | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' || true)"
+  if [[ -n "${service_error_snippet}" ]]; then
+    mark_note "Recent ${SERVICE_NAME} logs: ${service_error_snippet}"
+  fi
 fi
 
 if systemctl is-active --quiet nginx; then
