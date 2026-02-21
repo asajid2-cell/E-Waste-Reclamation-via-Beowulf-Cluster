@@ -492,6 +492,25 @@ while i < len(lines):
 changed = False
 matched = 0
 
+def strip_cluster_locations(block_lines):
+    local_changed = False
+    out = []
+    i = 0
+    while i < len(block_lines):
+        line = block_lines[i]
+        if location_exact_rx.search(line) or location_prefix_rx.search(line):
+            local_changed = True
+            depth = line.count("{") - line.count("}")
+            i += 1
+            while i < len(block_lines) and depth > 0:
+                depth += block_lines[i].count("{")
+                depth -= block_lines[i].count("}")
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    return out, local_changed
+
 for start, end in reversed(blocks):
     block = lines[start:end + 1]
     domain_hit = any(server_name_rx.search(ln) and domain_rx.search(ln) for ln in block)
@@ -499,27 +518,28 @@ for start, end in reversed(blocks):
         continue
     matched += 1
 
-    has_inline_cluster_locations = any(location_exact_rx.search(ln) or location_prefix_rx.search(ln) for ln in block)
+    stripped_block, removed_locations = strip_cluster_locations(block)
+    if removed_locations:
+        changed = True
 
-    new_block = [ln for ln in block if include_stmt not in ln]
+    new_block = [ln for ln in stripped_block if include_stmt not in ln]
     if len(new_block) != len(block):
         changed = True
 
-    if not has_inline_cluster_locations:
-        insert_after = None
-        for idx, ln in enumerate(new_block):
-            if server_name_rx.search(ln) and domain_rx.search(ln):
-                insert_after = idx
-        if insert_after is None:
-            insert_after = 0
+    insert_after = None
+    for idx, ln in enumerate(new_block):
+        if server_name_rx.search(ln) and domain_rx.search(ln):
+            insert_after = idx
+    if insert_after is None:
+        insert_after = 0
 
-        indent = "    "
-        if 0 <= insert_after < len(new_block):
-            m = re.match(r"^(\s*)", new_block[insert_after])
-            indent = m.group(1) if m else indent
-        include_line = f"{indent}{include_stmt}"
-        new_block.insert(insert_after + 1, include_line)
-        changed = True
+    indent = "    "
+    if 0 <= insert_after < len(new_block):
+        m = re.match(r"^(\s*)", new_block[insert_after])
+        indent = m.group(1) if m else indent
+    include_line = f"{indent}{include_stmt}"
+    new_block.insert(insert_after + 1, include_line)
+    changed = True
 
     lines[start:end + 1] = new_block
 
