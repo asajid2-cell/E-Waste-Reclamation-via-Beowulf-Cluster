@@ -185,6 +185,12 @@ If auto-detection picks the wrong proxy container, pass it explicitly:
 sudo bash deploy/setup_harmonizer_cluster_vps.sh --proxy-mode docker-proxy --docker-proxy-container <container_name>
 ```
 
+If `/cluster/client` is still 404 after deploy, check who owns `:443` on VPS and force that mode:
+
+```bash
+sudo ss -tulpn | grep ':443'
+```
+
 ## 6. Security Controls Included
 
 - `helmet` headers

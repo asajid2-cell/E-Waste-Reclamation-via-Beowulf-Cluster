@@ -586,6 +586,23 @@ detect_docker_proxy_container() {
   return 1
 }
 
+detect_tls_listener_owner() {
+  local listeners
+  listeners="$(ss -H -ltnp 'sport = :443' 2>/dev/null || true)"
+  if [[ -z "${listeners}" ]]; then
+    return 1
+  fi
+  if printf '%s' "${listeners}" | grep -Eqi 'docker-proxy|containerd|caddy'; then
+    printf '%s' "docker"
+    return 0
+  fi
+  if printf '%s' "${listeners}" | grep -Eqi 'nginx'; then
+    printf '%s' "nginx"
+    return 0
+  fi
+  printf '%s' "unknown"
+}
+
 get_container_network_gateway() {
   local container_name="$1"
   local network_name
@@ -1086,15 +1103,41 @@ detected_host_nginx_conf="${NGINX_SITE_CONF}"
 if [[ -z "${detected_host_nginx_conf}" ]]; then
   detected_host_nginx_conf="$(detect_host_nginx_site_conf || true)"
 fi
+tls_listener_owner="$(detect_tls_listener_owner || true)"
+if [[ -n "${tls_listener_owner}" ]]; then
+  mark_note "Detected local :443 listener owner: ${tls_listener_owner}"
+fi
 
 if [[ "${effective_proxy_mode}" == "auto" ]]; then
-  if [[ -n "${detected_host_nginx_conf}" ]]; then
-    effective_proxy_mode="host-nginx"
-  elif detect_docker_proxy_container && [[ "${DOCKER_PROXY_TYPE}" != "unknown" ]]; then
-    effective_proxy_mode="docker-proxy"
+  if [[ "${tls_listener_owner}" == "docker" ]]; then
+    if detect_docker_proxy_container && [[ "${DOCKER_PROXY_TYPE}" != "unknown" ]]; then
+      effective_proxy_mode="docker-proxy"
+    elif [[ -n "${detected_host_nginx_conf}" ]]; then
+      effective_proxy_mode="host-nginx"
+      mark_pending "443 appears docker-managed but docker proxy container was not confidently detected; falling back to host nginx setup."
+    else
+      effective_proxy_mode="host-nginx"
+      mark_pending "Could not confidently detect docker proxy container; falling back to host nginx setup."
+    fi
+  elif [[ "${tls_listener_owner}" == "nginx" ]]; then
+    if [[ -n "${detected_host_nginx_conf}" ]]; then
+      effective_proxy_mode="host-nginx"
+    elif detect_docker_proxy_container && [[ "${DOCKER_PROXY_TYPE}" != "unknown" ]]; then
+      effective_proxy_mode="docker-proxy"
+      mark_note "Nginx did not have a clear domain config; using detected docker proxy container."
+    else
+      effective_proxy_mode="host-nginx"
+      mark_pending "Could not confidently detect docker proxy container; falling back to host nginx setup."
+    fi
   else
-    effective_proxy_mode="host-nginx"
-    mark_pending "Could not confidently detect docker proxy container; falling back to host nginx setup."
+    if [[ -n "${detected_host_nginx_conf}" ]]; then
+      effective_proxy_mode="host-nginx"
+    elif detect_docker_proxy_container && [[ "${DOCKER_PROXY_TYPE}" != "unknown" ]]; then
+      effective_proxy_mode="docker-proxy"
+    else
+      effective_proxy_mode="host-nginx"
+      mark_pending "Could not confidently detect docker proxy container; falling back to host nginx setup."
+    fi
   fi
 fi
 mark_done "Proxy mode selected: ${effective_proxy_mode}."
@@ -1180,6 +1223,15 @@ EOF
   mark_done "nginx config test and reload succeeded."
 else
   configure_docker_proxy_route
+fi
+
+EDGE_HEALTH_HTTPS_URL="https://${DOMAIN}${BASE_PATH}/health"
+edge_https_status="$(curl -ksS -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" "${EDGE_HEALTH_HTTPS_URL}" || true)"
+if [[ "${edge_https_status}" == "200" ]]; then
+  mark_done "Local edge HTTPS route check passed (${EDGE_HEALTH_HTTPS_URL})."
+else
+  edge_http_status="$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: ${DOMAIN}" "http://127.0.0.1${BASE_PATH}/health" || true)"
+  mark_pending "Local edge route check was not clean (https status=${edge_https_status:-error}, http status=${edge_http_status:-error}); verify active proxy path for ${DOMAIN}${BASE_PATH}."
 fi
 
 if [[ "${INSTALL_FAIL2BAN}" == "1" ]]; then
