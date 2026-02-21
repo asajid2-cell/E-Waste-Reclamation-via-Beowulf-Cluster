@@ -906,9 +906,17 @@ self.onmessage = async (event) => {
         setConnectionState("connecting");
         const protocol = window.location.protocol === "https:" ? "wss" : "ws";
         const url = `${protocol}://${window.location.host}${withBase("/ws/worker")}?invite=${encodeURIComponent(inviteToken)}`;
-        ws = new WebSocket(url);
+        const socket = new WebSocket(url);
+        ws = socket;
 
-        ws.addEventListener("open", () => {
+        socket.addEventListener("open", () => {
+          if (ws !== socket) {
+            return;
+          }
+          if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+          }
           reconnectDelay = 500;
           setConnectionState("connected");
           appendLog(`connected to ${url}`);
@@ -917,7 +925,10 @@ self.onmessage = async (event) => {
           startHeartbeat();
         });
 
-        ws.addEventListener("message", (event) => {
+        socket.addEventListener("message", (event) => {
+          if (ws !== socket) {
+            return;
+          }
           let message = null;
           try {
             message = JSON.parse(event.data);
@@ -952,12 +963,21 @@ self.onmessage = async (event) => {
           }
         });
 
-        ws.addEventListener("close", (event) => {
+        socket.addEventListener("close", (event) => {
+          if (ws !== socket) {
+            return;
+          }
+          ws = null;
           clearHeartbeat();
           setConnectionState("disconnected");
           if (event.code === 1008) {
-            appendLog(`disconnected (${event.code}); invite rejected or expired`);
-            inviteErrorEl.textContent = "Invite rejected or expired. Request a fresh invite URL.";
+            const serverReason = typeof event.reason === "string" ? event.reason.trim() : "";
+            appendLog(
+              `disconnected (${event.code}); invite rejected${serverReason ? ` (${serverReason})` : " or expired"}`,
+            );
+            inviteErrorEl.textContent = serverReason
+              ? `${serverReason}. Request a fresh invite URL.`
+              : "Invite rejected or expired. Request a fresh invite URL.";
             return;
           }
           if (event.code === 1005) {
@@ -968,15 +988,13 @@ self.onmessage = async (event) => {
           scheduleReconnect();
         });
 
-        ws.addEventListener("error", () => {
+        socket.addEventListener("error", () => {
+          if (ws !== socket) {
+            return;
+          }
           clearHeartbeat();
           setConnectionState("disconnected");
-          appendLog("socket error");
-          try {
-            ws.close();
-          } catch (_err) {
-            // Ignore close errors.
-          }
+          appendLog("socket error (waiting for close/retry)");
         });
       }
 

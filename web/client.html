@@ -324,18 +324,20 @@
           <textarea
             id="scriptCode"
             class="mono"
-            placeholder="Example:
-const samples = Number(args.samples || 1_000_000);
+            placeholder="Paste your JS here"
+          >const units = Number(globalThis.__BRAIN__?.units || args.units || 1_000_000);
+if (!Number.isFinite(units) || units <= 0) {
+  throw new Error("units must be a positive number");
+}
 let hits = 0;
-for (let i = 0; i < samples; i += 1) {
+for (let i = 0; i < units; i += 1) {
   const x = Math.random();
   const y = Math.random();
-  if (x * x + y * y <= 1) hits += 1;
+  if (x * x + y * y <= 1) {
+    hits += 1;
+  }
 }
-const pi = 4 * hits / samples;
-console.log('estimated pi:', pi);
-return { samples, hits, pi };"
-          ></textarea>
+return { hits, samples: units };</textarea>
           <div class="script-options-row">
             <input id="scriptTimeoutMs" type="number" min="200" step="100" placeholder="run timeout ms (optional)" />
             <button id="submitScriptBtn" type="button">Run Script</button>
@@ -350,7 +352,7 @@ return { samples, hits, pi };"
                   <span class="tip-popup">Total amount of work across the full cluster run. Pi example: total random samples to throw.</span>
                 </span>
               </label>
-              <input id="shardTotalUnits" type="number" min="1" step="1" placeholder="e.g. 100000000" />
+              <input id="shardTotalUnits" type="number" min="1" step="1" value="100000000" placeholder="e.g. 100000000" />
             </div>
             <div class="setting-cell">
               <label class="setting-label" for="shardUnitsPerShard">
@@ -360,7 +362,7 @@ return { samples, hits, pi };"
                   <span class="tip-popup">Work size for each shard job. Lower = more shards and better load balancing; too low adds overhead.</span>
                 </span>
               </label>
-              <input id="shardUnitsPerShard" type="number" min="1" step="1" placeholder="e.g. 10000000" />
+              <input id="shardUnitsPerShard" type="number" min="1" step="1" value="10000000" placeholder="e.g. 10000000" />
             </div>
             <div class="setting-cell">
               <label class="setting-label" for="shardReducer">
@@ -387,7 +389,7 @@ return { samples, hits, pi };"
                   <span class="tip-popup">Only for SUM reducer. Numeric fields to add from each shard result. For Pi use hits,samples.</span>
                 </span>
               </label>
-              <input id="shardSumFields" class="mono" placeholder="e.g. hits,samples" />
+              <input id="shardSumFields" class="mono" value="hits,samples" placeholder="e.g. hits,samples" />
             </div>
             <div class="setting-cell">
               <label class="setting-label" for="scriptArgs">
@@ -667,6 +669,8 @@ return hits;</pre>
 
       function refreshAutoModeUi() {
         const model = detectExecutionModelFromInputs();
+        const workerCount = Number(workerCountEl.textContent);
+        const hasWorkerCount = Number.isInteger(workerCount);
         if (model === "single") {
           autoModeHintEl.textContent = "Mode: auto single (default)";
           autoModeHintEl.className = "hint mono";
@@ -675,8 +679,14 @@ return hits;</pre>
           return;
         }
         if (model === "sharded") {
-          autoModeHintEl.textContent = "Mode: auto sharded (cluster fan-out enabled)";
-          autoModeHintEl.className = "hint mono ok";
+          if (hasWorkerCount && workerCount < 2) {
+            autoModeHintEl.textContent =
+              "Mode: auto sharded requested, but server will run single until at least 2 workers are connected";
+            autoModeHintEl.className = "hint mono warn-text";
+          } else {
+            autoModeHintEl.textContent = "Mode: auto sharded (cluster fan-out enabled)";
+            autoModeHintEl.className = "hint mono ok";
+          }
           shardReducerEl.disabled = false;
           refreshReducerUi();
           return;
@@ -740,6 +750,7 @@ return hits;</pre>
         } catch (_err) {
           workerCountEl.textContent = "-";
         }
+        refreshAutoModeUi();
       }
 
       async function pollJob(jobId) {

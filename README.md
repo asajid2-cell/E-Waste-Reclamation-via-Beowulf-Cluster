@@ -68,6 +68,7 @@ Or generated as easy word phrases:
 Short/phrase invite aliases are stored in memory for MVP and reset on server restart.
 
 Invite tokens are HMAC-signed by `WORKER_INVITE_SECRET` and expire by TTL.
+By default (`WORKER_INVITE_REQUIRE_LATEST=1`), only the most recently generated invite is accepted; older invites are rejected as stale.
 
 ### Signed custom jobs
 
@@ -117,6 +118,7 @@ Use `pi-sharded.js` when you want cluster fan-out:
 
 If shard fields are left empty, run mode auto-resolves to `single`.
 For `run_js`, reducers read numeric fields from top-level result or `returnValue`.
+If sharded mode is requested but fewer than 2 workers are connected, server auto-runs the job as a single task.
 
 Then compute `pi ~= 4 * (aggregate.hits / aggregate.samples)`.
 

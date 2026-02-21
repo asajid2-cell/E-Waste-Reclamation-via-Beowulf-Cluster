@@ -412,10 +412,36 @@ app.post(withBasePath("/api/jobs/run-js"), auth.requireClientAuth, (req, res) =>
     return res.status(400).json({ error: parsed.error });
   }
 
-  const job =
-    parsed.value.executionModel === "sharded" ? store.createShardedRunJsJob(parsed.value) : store.createJob(parsed.value);
+  const connectedWorkers = store.listWorkers().length;
+  let createValue = parsed.value;
+  let executionNote = null;
+  if (parsed.value.executionModel === "sharded" && connectedWorkers < 2) {
+    const fallbackArgs = {
+      ...(parsed.value.args && typeof parsed.value.args === "object" && !Array.isArray(parsed.value.args)
+        ? parsed.value.args
+        : {}),
+    };
+    if (!Object.prototype.hasOwnProperty.call(fallbackArgs, "units") && parsed.value.shardConfig) {
+      fallbackArgs.units = parsed.value.shardConfig.totalUnits;
+    }
+    createValue = {
+      ...parsed.value,
+      args: fallbackArgs,
+      executionModel: "single",
+      shardConfig: null,
+      reducer: null,
+    };
+    executionNote = "Sharded execution auto-downgraded to single because fewer than 2 workers are connected.";
+  }
+
+  const job = createValue.executionModel === "sharded" ? store.createShardedRunJsJob(createValue) : store.createJob(createValue);
   dispatcher.dispatch();
-  return res.status(201).json({ jobId: job.jobId, status: job.status });
+  return res.status(201).json({
+    jobId: job.jobId,
+    status: job.status,
+    executionModel: job.executionModel || "single",
+    note: executionNote,
+  });
 });
 
 app.get(withBasePath("/api/jobs/:jobId"), auth.requireClientAuth, (req, res) => {
@@ -444,6 +470,7 @@ const wss = new WebSocketServer({
   server,
   path: WS_WORKER_PATH,
   maxPayload: WS_MAX_PAYLOAD,
+  perMessageDeflate: false,
 });
 
 const connectionsPerIp = new Map();
@@ -606,10 +633,21 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  ws.on("close", () => {
+  ws.on("close", (code, reasonBuffer) => {
     clearInterval(resetMessageBudgetTimer);
     clearInterval(heartbeatTimer);
     decConnections(ip);
+    const reason =
+      typeof reasonBuffer === "string"
+        ? reasonBuffer
+        : Buffer.isBuffer(reasonBuffer)
+          ? reasonBuffer.toString("utf8")
+          : "";
+    console.log(
+      `[worker_ws_close] ip=${ip} code=${code} reason=${reason ? JSON.stringify(reason) : "\"\""} worker=${
+        ws.meta && ws.meta.registeredWorkerId ? ws.meta.registeredWorkerId : "unknown"
+      }`,
+    );
 
     const removed = store.removeWorkerSocket(ws);
     if (removed.workerId) {

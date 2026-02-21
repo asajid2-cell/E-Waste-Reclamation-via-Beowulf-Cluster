@@ -101,6 +101,20 @@ function parseNonNegativeInt(value, fallback) {
   return n;
 }
 
+function parseBoolean(value, fallback) {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
 function decodeBase64(value, name) {
   try {
     return Buffer.from(value, "base64");
@@ -220,6 +234,8 @@ function resolveConfig() {
     customJobMaxTimeoutMs,
   );
 
+  const workerInviteRequireLatest = parseBoolean(process.env.WORKER_INVITE_REQUIRE_LATEST, true);
+
   return {
     env,
     clientApiKey,
@@ -232,6 +248,7 @@ function resolveConfig() {
     customJobDefaultTimeoutMs,
     customJobMinTimeoutMs,
     customJobMaxTimeoutMs,
+    workerInviteRequireLatest,
     jobSigningPrivateKey: signingKeys.privateKey,
     jobSigningPublicKey: signingKeys.publicKey,
     jobSigningPublicKeySpkiB64: signingKeys.publicKeySpkiB64,
@@ -253,6 +270,8 @@ function extractClientToken(req) {
 function createAuth(config) {
   const sign = buildSigner(config.workerInviteSecret);
   const configuredClientKeyBytes = tokenToBytes(config.clientApiKey);
+  let latestInviteJti = "";
+  let latestInviteIssuedAtSec = 0;
 
   function signWorkerAssignment(job) {
     if (!job || !job.task || job.task.op !== "run_js") {
@@ -312,6 +331,8 @@ function createAuth(config) {
     };
     const payloadPart = toBase64Url(JSON.stringify(payload));
     const signaturePart = sign(payloadPart);
+    latestInviteJti = payload.jti;
+    latestInviteIssuedAtSec = payload.iat;
     return {
       token: `v1.${payloadPart}.${signaturePart}`,
       expiresAt: new Date(payload.exp * 1000).toISOString(),
@@ -348,6 +369,17 @@ function createAuth(config) {
     const nowSec = Math.floor(Date.now() / 1000);
     if (!Number.isInteger(payload.exp) || payload.exp < nowSec) {
       return { ok: false, reason: "expired_token" };
+    }
+    if (config.workerInviteRequireLatest) {
+      if (!latestInviteJti) {
+        return { ok: false, reason: "no_active_invite" };
+      }
+      if (payload.jti !== latestInviteJti) {
+        return { ok: false, reason: "stale_token" };
+      }
+      if (!Number.isInteger(payload.iat) || payload.iat < latestInviteIssuedAtSec) {
+        return { ok: false, reason: "stale_token" };
+      }
     }
 
     return { ok: true, payload };
