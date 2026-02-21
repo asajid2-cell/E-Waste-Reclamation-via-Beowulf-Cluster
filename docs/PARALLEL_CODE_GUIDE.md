@@ -54,7 +54,7 @@ return { hits, samples: units };
 Script:
 
 ```js
-const units = Number(globalThis.__BRAIN__?.units || 10_000_000);
+const units = Number(globalThis.__BRAIN__?.units || 100_000);
 let hits = 0;
 for (let i = 0; i < units; i += 1) {
   const x = Math.random();
@@ -66,8 +66,8 @@ return { hits, samples: units };
 
 UI settings:
 
-- `total units`: `100000000`
-- `units per shard`: `10000000`
+- `total units`: `2000000`
+- `units per shard`: `100000`
 - reducer: `sum`
 - sum fields: `hits,samples`
 

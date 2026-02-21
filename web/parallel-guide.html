@@ -90,7 +90,7 @@ return { hits, samples: units };</code></pre>
 
       <div class="card">
         <h2>Pi Example</h2>
-        <pre><code>const units = Number(globalThis.__BRAIN__?.units || 10_000_000);
+        <pre><code>const units = Number(globalThis.__BRAIN__?.units || 100_000);
 let hits = 0;
 for (let i = 0; i &lt; units; i += 1) {
   const x = Math.random();
@@ -100,8 +100,8 @@ for (let i = 0; i &lt; units; i += 1) {
 return { hits, samples: units };</code></pre>
         <p>Use:</p>
         <ul>
-          <li><code>total units=100000000</code></li>
-          <li><code>units per shard=10000000</code></li>
+          <li><code>total units=2000000</code></li>
+          <li><code>units per shard=100000</code></li>
           <li><code>reducer=sum</code></li>
           <li><code>sum fields=hits,samples</code></li>
         </ul>

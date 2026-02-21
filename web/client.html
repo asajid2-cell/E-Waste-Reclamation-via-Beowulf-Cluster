@@ -62,11 +62,12 @@
       }
       .script-options-row {
         display: grid;
-        grid-template-columns: 1fr 180px auto;
+        grid-template-columns: minmax(0, 1fr) 180px minmax(0, 1fr);
         gap: 0.6rem;
+        align-items: center;
       }
       .settings-grid {
-        grid-template-columns: 1fr 1fr 220px;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 220px);
       }
       .setting-cell {
         display: grid;
@@ -104,7 +105,7 @@
         position: absolute;
         left: 22px;
         top: -6px;
-        width: 250px;
+        width: min(250px, calc(100vw - 3rem));
         z-index: 20;
         opacity: 0;
         pointer-events: none;
@@ -131,6 +132,7 @@
         gap: 0.25rem;
         color: var(--muted);
         font-size: 0.86rem;
+        overflow-wrap: anywhere;
       }
       .file-picker {
         display: grid;
@@ -153,6 +155,8 @@
         border: 1px solid #4c6898;
         padding: 0.6rem 0.8rem;
         font-size: 0.95rem;
+        box-sizing: border-box;
+        max-width: 100%;
       }
       input,
       select,
@@ -173,6 +177,7 @@
       .hint {
         color: var(--muted);
         font-size: 0.9rem;
+        overflow-wrap: anywhere;
       }
       .guide-code {
         margin: 0;
@@ -199,6 +204,7 @@
         font-size: 0.85rem;
         display: flex;
         align-items: center;
+        overflow-wrap: anywhere;
       }
       button {
         background: var(--accent);
@@ -241,6 +247,7 @@
       }
       #scriptCode {
         min-height: 160px;
+        width: 100%;
       }
       .qr-panel {
         display: flex;
@@ -352,7 +359,7 @@ return { hits, samples: units };</textarea>
                   <span class="tip-popup">Total amount of work across the full cluster run. Pi example: total random samples to throw.</span>
                 </span>
               </label>
-              <input id="shardTotalUnits" type="number" min="1" step="1" value="100000000" placeholder="e.g. 100000000" />
+              <input id="shardTotalUnits" type="number" min="1" step="1" value="2000000" placeholder="e.g. 2000000" />
             </div>
             <div class="setting-cell">
               <label class="setting-label" for="shardUnitsPerShard">
@@ -362,7 +369,7 @@ return { hits, samples: units };</textarea>
                   <span class="tip-popup">Work size for each shard job. Lower = more shards and better load balancing; too low adds overhead.</span>
                 </span>
               </label>
-              <input id="shardUnitsPerShard" type="number" min="1" step="1" value="10000000" placeholder="e.g. 10000000" />
+              <input id="shardUnitsPerShard" type="number" min="1" step="1" value="100000" placeholder="e.g. 100000" />
             </div>
             <div class="setting-cell">
               <label class="setting-label" for="shardReducer">
@@ -399,7 +406,7 @@ return { hits, samples: units };</textarea>
                   <span class="tip-popup">Optional parameters passed to script as args. Example: {\"seed\":123,\"samples\":1000000}</span>
                 </span>
               </label>
-              <input id="scriptArgs" class="mono" placeholder='optional, e.g. {"samples":10000000}' />
+              <input id="scriptArgs" class="mono" placeholder='optional, e.g. {"samples":1000000}' />
             </div>
             <div class="script-tip-block">
               <span>Auto mode: both shard fields empty = single; both filled = sharded.</span>
@@ -407,7 +414,7 @@ return { hits, samples: units };</textarea>
             </div>
           </div>
           <div class="script-options-row">
-            <div class="script-inline-note">For Pi: <span class="mono">&nbsp;total=100000000, shard=10000000, reducer=sum, fields=hits,samples</span>.</div>
+            <div class="script-inline-note">For Pi: <span class="mono">&nbsp;total=2000000, shard=100000, reducer=sum, fields=hits,samples</span>.</div>
             <div></div>
             <div></div>
           </div>

@@ -1,5 +1,5 @@
 const MAX_JOB_LOOKUP_ID_LENGTH = 128;
-const MAX_SHARDS_PER_JOB = 5000;
+const MAX_SHARDS_PER_JOB = 20000;
 
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);

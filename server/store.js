@@ -109,6 +109,7 @@ function createStore(options = {}) {
   const jobs = new Map();
   const queue = [];
   const workers = new Map();
+  const workerStats = new Map();
   const socketToWorker = new Map();
   const assignments = new Map();
 
@@ -120,6 +121,98 @@ function createStore(options = {}) {
     job.updatedAt = nowIso();
   }
 
+  function ensureWorkerStats(workerId) {
+    const nowMs = Date.now();
+    const existing = workerStats.get(workerId);
+    if (existing) {
+      return existing;
+    }
+    const created = {
+      workerId,
+      firstSeenAt: nowMs,
+      lastSeenAt: nowMs,
+      lastConnectedAt: 0,
+      connected: false,
+      reconnects: 0,
+      completedJobs: 0,
+      completedAddJobs: 0,
+      completedRunJsJobs: 0,
+      completedShards: 0,
+      failedJobs: 0,
+      failedShards: 0,
+      contributedUnits: 0,
+      totalDurationMs: 0,
+      lastJobAt: 0,
+    };
+    workerStats.set(workerId, created);
+    return created;
+  }
+
+  function markWorkerConnected(workerId) {
+    const stats = ensureWorkerStats(workerId);
+    const nowMs = Date.now();
+    if (stats.lastConnectedAt > 0) {
+      stats.reconnects += 1;
+    }
+    stats.connected = true;
+    stats.lastConnectedAt = nowMs;
+    stats.lastSeenAt = nowMs;
+    return stats;
+  }
+
+  function markWorkerDisconnected(workerId) {
+    const stats = ensureWorkerStats(workerId);
+    stats.connected = false;
+    stats.lastSeenAt = Date.now();
+    return stats;
+  }
+
+  function recordWorkerSeen(workerId) {
+    const stats = ensureWorkerStats(workerId);
+    stats.lastSeenAt = Date.now();
+    return stats;
+  }
+
+  function recordWorkerCompletion(workerId, job, normalizedResult) {
+    const stats = ensureWorkerStats(workerId);
+    const nowMs = Date.now();
+    stats.lastSeenAt = nowMs;
+    stats.completedJobs += 1;
+    stats.lastJobAt = nowMs;
+
+    if (job && job.task && job.task.op === "add") {
+      stats.completedAddJobs += 1;
+    } else if (job && job.task && job.task.op === "run_js") {
+      stats.completedRunJsJobs += 1;
+    }
+
+    if (job && job.parentJobId) {
+      stats.completedShards += 1;
+      const units = Number(job.shardContextBase && job.shardContextBase.units);
+      if (Number.isFinite(units) && units > 0) {
+        stats.contributedUnits += units;
+      }
+    }
+
+    const durationMs = Number(
+      normalizedResult && typeof normalizedResult === "object" ? normalizedResult.durationMs : Number.NaN,
+    );
+    if (Number.isFinite(durationMs) && durationMs >= 0) {
+      stats.totalDurationMs += durationMs;
+    } else if (Number.isFinite(job && job.assignedAtMs ? job.assignedAtMs : Number.NaN)) {
+      stats.totalDurationMs += Math.max(0, nowMs - job.assignedAtMs);
+    }
+  }
+
+  function recordWorkerFailure(workerId, job) {
+    const stats = ensureWorkerStats(workerId);
+    stats.lastSeenAt = Date.now();
+    stats.failedJobs += 1;
+    if (job && job.parentJobId) {
+      stats.failedShards += 1;
+    }
+  }
+
   function createJob(task, createOptions = {}) {
     const jobId = createOptions.jobId || randomUUID();
     const job = {
@@ -129,6 +222,7 @@ function createStore(options = {}) {
       result: null,
       error: null,
       assignedWorkerId: null,
+      assignedAtMs: null,
       hidden: Boolean(createOptions.hidden),
       parentJobId: createOptions.parentJobId || null,
       executionModel: createOptions.executionModel || "single",
@@ -280,6 +374,7 @@ function createStore(options = {}) {
       state: "idle",
       lastSeenAt: Date.now(),
     });
+    markWorkerConnected(workerId);
     socketToWorker.set(ws, workerId);
   }
 
@@ -307,6 +402,7 @@ function createStore(options = {}) {
     }
     worker.state = "idle";
     worker.lastSeenAt = Date.now();
+    recordWorkerSeen(workerId);
     return true;
   }
 
@@ -316,6 +412,7 @@ function createStore(options = {}) {
       return false;
     }
     worker.lastSeenAt = Date.now();
+    recordWorkerSeen(workerId);
     return true;
   }
 
@@ -334,6 +431,7 @@ function createStore(options = {}) {
     }
     job.status = "running";
     job.assignedWorkerId = workerId;
+    job.assignedAtMs = Date.now();
     job.attempt += 1;
     touchJob(job);
     worker.state = "busy";
@@ -402,10 +500,12 @@ function createStore(options = {}) {
     job.result = normalizedResult;
     job.error = null;
     job.assignedWorkerId = workerId;
+    job.assignedAtMs = null;
     touchJob(job);
 
     worker.state = "idle";
     worker.lastSeenAt = Date.now();
+    recordWorkerCompletion(workerId, job, normalizedResult);
 
     if (job.parentJobId) {
       const parentJob = jobs.get(job.parentJobId);
@@ -423,13 +523,30 @@ function createStore(options = {}) {
       }
       parentJob.completedShards += 1;
       if (parentJob.completedShards >= parentJob.totalShards) {
-        parentJob.status = "done";
-        parentJob.result = {
+        const finalResult = {
           reducer: parentJob.reducer,
           aggregate: parentJob.aggregate,
           completedShards: parentJob.completedShards,
           totalShards: parentJob.totalShards,
         };
+        if (
+          parentJob.reducer &&
+          parentJob.reducer.type === "sum" &&
+          parentJob.aggregate &&
+          typeof parentJob.aggregate === "object" &&
+          !Array.isArray(parentJob.aggregate)
+        ) {
+          const hits = Number(parentJob.aggregate.hits);
+          const samples = Number(parentJob.aggregate.samples);
+          if (Number.isFinite(hits) && Number.isFinite(samples) && samples > 0) {
+            finalResult.derived = {
+              piEstimate: (4 * hits) / samples,
+              hitRatio: hits / samples,
+            };
+          }
+        }
+        parentJob.status = "done";
+        parentJob.result = finalResult;
         parentJob.error = null;
       }
       touchJob(parentJob);
@@ -457,6 +574,7 @@ function createStore(options = {}) {
       job.status = "queued";
       job.error = `retryable:${error}`;
       job.assignedWorkerId = null;
+      job.assignedAtMs = null;
       touchJob(job);
       requeueJob(jobId, true);
       return { ok: true, requeued: true };
@@ -465,7 +583,9 @@ function createStore(options = {}) {
     job.status = "failed";
     job.error = error;
     job.assignedWorkerId = workerId;
+    job.assignedAtMs = null;
     touchJob(job);
+    recordWorkerFailure(workerId, job);
 
     if (job.parentJobId) {
       const parentJob = jobs.get(job.parentJobId);
@@ -511,6 +631,7 @@ function createStore(options = {}) {
     }
 
     workers.delete(workerId);
+    markWorkerDisconnected(workerId);
     return { workerId, requeuedJobId };
   }
 
@@ -521,6 +642,82 @@ function createStore(options = {}) {
       state: worker.state,
       lastSeenMs: Math.max(0, now - worker.lastSeenAt),
     }));
+  }
+
+  function getWorkerMetricsSnapshot(targetWorkerId = null) {
+    const nowMs = Date.now();
+    const allWorkerIds = new Set([...workerStats.keys(), ...workers.keys()]);
+    const rows = [];
+
+    for (const workerId of allWorkerIds) {
+      const stats = ensureWorkerStats(workerId);
+      const connectedWorker = workers.get(workerId);
+      const connected = Boolean(connectedWorker);
+      const completedJobs = stats.completedJobs || 0;
+      const avgDurationMs = completedJobs > 0 ? stats.totalDurationMs / completedJobs : 0;
+
+      rows.push({
+        workerId,
+        connected,
+        state: connectedWorker ? connectedWorker.state : "offline",
+        lastSeenMs: Math.max(0, nowMs - stats.lastSeenAt),
+        reconnects: stats.reconnects,
+        completedJobs,
+        completedAddJobs: stats.completedAddJobs,
+        completedRunJsJobs: stats.completedRunJsJobs,
+        completedShards: stats.completedShards,
+        failedJobs: stats.failedJobs,
+        failedShards: stats.failedShards,
+        contributedUnits: stats.contributedUnits,
+        totalDurationMs: stats.totalDurationMs,
+        avgDurationMs,
+        firstSeenAt: stats.firstSeenAt ? new Date(stats.firstSeenAt).toISOString() : null,
+        lastJobAt: stats.lastJobAt ? new Date(stats.lastJobAt).toISOString() : null,
+      });
+    }
+
+    rows.sort((a, b) => {
+      if (b.completedShards !== a.completedShards) {
+        return b.completedShards - a.completedShards;
+      }
+      if (b.contributedUnits !== a.contributedUnits) {
+        return b.contributedUnits - a.contributedUnits;
+      }
+      return b.completedJobs - a.completedJobs;
+    });
+
+    const totals = rows.reduce(
+      (acc, row) => {
+        acc.workersTracked += 1;
+        acc.workersConnected += row.connected ? 1 : 0;
+        acc.completedJobs += row.completedJobs;
+        acc.completedShards += row.completedShards;
+        acc.failedJobs += row.failedJobs;
+        acc.failedShards += row.failedShards;
+        acc.contributedUnits += row.contributedUnits;
+        acc.totalDurationMs += row.totalDurationMs;
+        return acc;
+      },
+      {
+        workersTracked: 0,
+        workersConnected: 0,
+        completedJobs: 0,
+        completedShards: 0,
+        failedJobs: 0,
+        failedShards: 0,
+        contributedUnits: 0,
+        totalDurationMs: 0,
+      },
+    );
+
+    const self = targetWorkerId ? rows.find((row) => row.workerId === targetWorkerId) || null : null;
+
+    return {
+      now: new Date(nowMs).toISOString(),
+      self,
+      workers: rows,
+      totals,
+    };
   }
 
   return {
@@ -543,6 +740,7 @@ function createStore(options = {}) {
     failJob,
     removeWorkerSocket,
     listWorkers,
+    getWorkerMetricsSnapshot,
     maxCustomResultBytes,
   };
 }

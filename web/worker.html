@@ -60,6 +60,48 @@
       .err {
         color: var(--error);
       }
+      .metric-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0.45rem 0.9rem;
+      }
+      .metric-label {
+        color: var(--muted);
+      }
+      .metric-value {
+        font-weight: 700;
+      }
+      .graph {
+        margin-top: 0.8rem;
+        display: grid;
+        gap: 0.45rem;
+      }
+      .graph-row {
+        display: grid;
+        grid-template-columns: minmax(130px, 190px) minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 0.5rem;
+      }
+      .graph-label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .graph-track {
+        height: 10px;
+        border-radius: 999px;
+        border: 1px solid #4a688f;
+        background: #0e1e35;
+        overflow: hidden;
+      }
+      .graph-fill {
+        height: 100%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, #52b6f5, #06d6a0);
+      }
+      .muted {
+        color: var(--muted);
+      }
       button {
         border-radius: 8px;
         border: 1px solid #4c6898;
@@ -83,6 +125,15 @@
         overflow-y: auto;
         color: var(--muted);
       }
+      @media (max-width: 640px) {
+        .metric-grid {
+          grid-template-columns: 1fr;
+        }
+        .graph-row {
+          grid-template-columns: 1fr;
+          gap: 0.3rem;
+        }
+      }
     </style>
   </head>
   <body>
@@ -103,6 +154,19 @@
         </p>
         <p id="wakeHint" class="mono"></p>
         <p id="inviteError" class="err"></p>
+      </div>
+
+      <div class="card">
+        <strong>Contribution Metrics</strong>
+        <div class="metric-grid">
+          <div><span class="metric-label">Your Completed Shards:</span> <span id="selfCompletedShards" class="metric-value mono">0</span></div>
+          <div><span class="metric-label">Your Contributed Units:</span> <span id="selfContributedUnits" class="metric-value mono">0</span></div>
+          <div><span class="metric-label">Your Completed Jobs:</span> <span id="selfCompletedJobs" class="metric-value mono">0</span></div>
+          <div><span class="metric-label">Your Avg Duration:</span> <span id="selfAvgDuration" class="metric-value mono">0 ms</span></div>
+          <div><span class="metric-label">Cluster Shards Done:</span> <span id="clusterCompletedShards" class="metric-value mono">0</span></div>
+          <div><span class="metric-label">Workers Tracked:</span> <span id="clusterWorkersTracked" class="metric-value mono">0</span></div>
+        </div>
+        <div class="graph" id="contribGraph"></div>
       </div>
 
       <div class="card">
@@ -466,6 +530,13 @@ self.onmessage = async (event) => {
       const wakeBtnEl = document.getElementById("wakeBtn");
       const wakeHintEl = document.getElementById("wakeHint");
       const inviteErrorEl = document.getElementById("inviteError");
+      const selfCompletedShardsEl = document.getElementById("selfCompletedShards");
+      const selfContributedUnitsEl = document.getElementById("selfContributedUnits");
+      const selfCompletedJobsEl = document.getElementById("selfCompletedJobs");
+      const selfAvgDurationEl = document.getElementById("selfAvgDuration");
+      const clusterCompletedShardsEl = document.getElementById("clusterCompletedShards");
+      const clusterWorkersTrackedEl = document.getElementById("clusterWorkersTracked");
+      const contribGraphEl = document.getElementById("contribGraph");
       const logEl = document.getElementById("log");
 
       const workerId = getWorkerId();
@@ -479,6 +550,8 @@ self.onmessage = async (event) => {
       let verifyKeyPromise = null;
       let maxResultBytes = DEFAULT_MAX_RESULT_BYTES;
       let wakeLockSentinel = null;
+      let metricsTimer = null;
+      let metricsErrorShown = false;
 
       workerIdEl.textContent = workerId;
       inviteStateEl.textContent = inviteToken ? "present" : "missing";
@@ -487,6 +560,109 @@ self.onmessage = async (event) => {
         const timestamp = new Date().toLocaleTimeString();
         logEl.textContent += `[${timestamp}] ${line}\n`;
         logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function formatNumber(value) {
+        const n = Number(value);
+        if (!Number.isFinite(n)) {
+          return "0";
+        }
+        return new Intl.NumberFormat().format(Math.trunc(n));
+      }
+
+      function formatDurationMs(value) {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n <= 0) {
+          return "0 ms";
+        }
+        if (n < 1000) {
+          return `${Math.round(n)} ms`;
+        }
+        return `${(n / 1000).toFixed(2)} s`;
+      }
+
+      function renderContributionGraph(workers) {
+        if (!Array.isArray(workers) || workers.length === 0) {
+          contribGraphEl.innerHTML = '<div class="muted">No contribution data yet.</div>';
+          return;
+        }
+
+        const topWorkers = workers.slice(0, 12);
+        const maxShards = Math.max(...topWorkers.map((w) => Number(w.completedShards) || 0), 1);
+        const rowsHtml = topWorkers
+          .map((worker) => {
+            const shards = Number(worker.completedShards) || 0;
+            const units = Number(worker.contributedUnits) || 0;
+            const pct = Math.max(0, Math.min(100, (shards / maxShards) * 100));
+            const label = `${worker.workerId}${worker.workerId === workerId ? " (you)" : ""}`;
+            return `
+              <div class="graph-row">
+                <div class="graph-label mono" title="${label}">${label}</div>
+                <div class="graph-track"><div class="graph-fill" style="width:${pct.toFixed(2)}%"></div></div>
+                <div class="mono" title="shards / units">${formatNumber(shards)} / ${formatNumber(units)}</div>
+              </div>
+            `;
+          })
+          .join("");
+        contribGraphEl.innerHTML = rowsHtml;
+      }
+
+      function renderMetrics(snapshot) {
+        const self = snapshot && snapshot.self ? snapshot.self : null;
+        const totals = snapshot && snapshot.totals ? snapshot.totals : {};
+        const workers = snapshot && Array.isArray(snapshot.workers) ? snapshot.workers : [];
+
+        selfCompletedShardsEl.textContent = formatNumber(self ? self.completedShards : 0);
+        selfContributedUnitsEl.textContent = formatNumber(self ? self.contributedUnits : 0);
+        selfCompletedJobsEl.textContent = formatNumber(self ? self.completedJobs : 0);
+        selfAvgDurationEl.textContent = formatDurationMs(self ? self.avgDurationMs : 0);
+
+        clusterCompletedShardsEl.textContent = formatNumber(totals.completedShards || 0);
+        clusterWorkersTrackedEl.textContent = formatNumber(totals.workersTracked || 0);
+
+        renderContributionGraph(workers);
+      }
+
+      async function fetchMetrics() {
+        if (!inviteToken) {
+          return;
+        }
+        const metricsUrl =
+          `${withBase("/api/worker/metrics")}?invite=${encodeURIComponent(inviteToken)}&workerId=${encodeURIComponent(workerId)}`;
+        try {
+          const response = await fetch(metricsUrl, { cache: "no-store" });
+          if (!response.ok) {
+            let details = "";
+            try {
+              const errBody = await response.json();
+              details = errBody && errBody.error ? String(errBody.error) : "";
+            } catch (_err) {
+              details = "";
+            }
+            if (response.status === 401) {
+              inviteErrorEl.textContent = "Invite is no longer valid for metrics. Request a fresh invite URL.";
+            }
+            throw new Error(details || `metrics request failed (${response.status})`);
+          }
+          const snapshot = await response.json();
+          renderMetrics(snapshot);
+          metricsErrorShown = false;
+        } catch (error) {
+          if (!metricsErrorShown) {
+            appendLog(`metrics unavailable: ${error.message}`);
+            metricsErrorShown = true;
+          }
+        }
+      }
+
+      function startMetricsPolling() {
+        if (metricsTimer) {
+          clearInterval(metricsTimer);
+        }
+        fetchMetrics().catch(() => {});
+        metricsTimer = setInterval(() => {
+          fetchMetrics().catch(() => {});
+        }, 3000);
       }
 
       function setConnectionState(state) {
@@ -923,6 +1099,7 @@ self.onmessage = async (event) => {
           send({ type: "register", workerId });
           send({ type: "ready", workerId });
           startHeartbeat();
+          fetchMetrics().catch(() => {});
         });
 
         socket.addEventListener("message", (event) => {
@@ -999,7 +1176,13 @@ self.onmessage = async (event) => {
       }
 
       connect();
+      startMetricsPolling();
       initializeWakeLock();
+      window.addEventListener("beforeunload", () => {
+        if (metricsTimer) {
+          clearInterval(metricsTimer);
+        }
+      });
     </script>
   </body>
 </html>

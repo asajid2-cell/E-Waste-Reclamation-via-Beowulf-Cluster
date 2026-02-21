@@ -465,6 +465,21 @@ app.get(withBasePath("/api/workers"), auth.requireClientAuth, (_req, res) => {
   return res.json({ count: workers.length, workers });
 });
 
+app.get(withBasePath("/api/worker/metrics"), (req, res) => {
+  const inviteToken =
+    typeof req.query.invite === "string" ? req.query.invite : Array.isArray(req.query.invite) ? req.query.invite[0] : "";
+  const workerId =
+    typeof req.query.workerId === "string" ? req.query.workerId : Array.isArray(req.query.workerId) ? req.query.workerId[0] : null;
+
+  const inviteValidation = auth.verifyWorkerInvite(inviteToken || "");
+  if (!inviteValidation.ok) {
+    return res.status(401).json({ error: `Unauthorized worker invite: ${inviteValidation.reason}` });
+  }
+
+  const snapshot = store.getWorkerMetricsSnapshot(workerId || null);
+  return res.json(snapshot);
+});
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({
   server,
