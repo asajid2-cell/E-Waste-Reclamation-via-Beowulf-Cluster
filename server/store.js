@@ -5,6 +5,7 @@ const MAX_VALUE = 1_000_000_000;
 const DEFAULT_MAX_CUSTOM_RESULT_BYTES = 64 * 1024;
 const DEFAULT_MAX_SHARD_ATTEMPTS = 3;
 const DEFAULT_MAX_WORKER_SLOTS = 8;
+const DEFAULT_JOB_EVENT_BUFFER_SIZE = 4000;
 
 function isValidInputNumber(value) {
   return Number.isInteger(value) && value >= MIN_VALUE && value <= MAX_VALUE;
@@ -127,6 +128,9 @@ function createStore(options = {}) {
   const maxWorkerSlots = Number.isInteger(options.maxWorkerSlots) && options.maxWorkerSlots > 0
     ? options.maxWorkerSlots
     : DEFAULT_MAX_WORKER_SLOTS;
+  const maxJobEventBufferSize = Number.isInteger(options.maxJobEventBufferSize) && options.maxJobEventBufferSize > 0
+    ? options.maxJobEventBufferSize
+    : DEFAULT_JOB_EVENT_BUFFER_SIZE;
 
   const jobs = new Map();
   const queue = [];
@@ -134,6 +138,7 @@ function createStore(options = {}) {
   const workerStats = new Map();
   const socketToWorker = new Map();
   const assignments = new Map();
+  const jobEventBuffers = new Map();
 
   function clampNumber(value, minValue, maxValue, fallback) {
     const n = Number(value);
@@ -240,6 +245,69 @@ function createStore(options = {}) {
 
   function touchJob(job) {
     job.updatedAt = nowIso();
+  }
+
+  function normalizeResultForLiveEvent(normalizedResult) {
+    if (!normalizedResult || typeof normalizedResult !== "object") {
+      return normalizedResult;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(normalizedResult, "returnValue") &&
+      normalizedResult.returnValue !== undefined
+    ) {
+      return normalizedResult.returnValue;
+    }
+    return normalizedResult;
+  }
+
+  function ensureJobEventBuffer(jobId) {
+    const existing = jobEventBuffers.get(jobId);
+    if (existing) {
+      return existing;
+    }
+    const created = {
+      nextSeq: 1,
+      events: [],
+    };
+    jobEventBuffers.set(jobId, created);
+    return created;
+  }
+
+  function appendJobEvent(jobId, payload) {
+    if (!jobId || !payload || typeof payload !== "object") {
+      return null;
+    }
+    const buffer = ensureJobEventBuffer(jobId);
+    const event = {
+      seq: buffer.nextSeq,
+      ts: nowIso(),
+      ...payload,
+    };
+    buffer.nextSeq += 1;
+    buffer.events.push(event);
+    while (buffer.events.length > maxJobEventBufferSize) {
+      buffer.events.shift();
+    }
+    return event;
+  }
+
+  function getJobEvents(jobId, afterSeq = 0, limit = 64) {
+    const after = Number.isSafeInteger(afterSeq) && afterSeq >= 0 ? afterSeq : 0;
+    const maxLimit = 256;
+    const safeLimit = Number.isSafeInteger(limit) && limit > 0 ? Math.min(limit, maxLimit) : 64;
+    const buffer = ensureJobEventBuffer(jobId);
+    const firstSeq = buffer.events.length > 0 ? buffer.events[0].seq : buffer.nextSeq;
+    const startIndex = Math.max(0, after - firstSeq + 1);
+    const events = buffer.events.slice(startIndex, startIndex + safeLimit);
+    const hasMore = startIndex + events.length < buffer.events.length;
+    const droppedBeforeSeq = after + 1 < firstSeq ? firstSeq - (after + 1) : 0;
+    return {
+      events,
+      hasMore,
+      nextSeq: buffer.nextSeq,
+      firstSeq,
+      droppedBeforeSeq,
+    };
   }
 
   function ensureWorkerStats(workerId) {
@@ -480,6 +548,16 @@ function createStore(options = {}) {
       offset += units;
     }
 
+    appendJobEvent(parentJob.jobId, {
+      type: "job_started",
+      jobId: parentJob.jobId,
+      executionModel: "sharded",
+      totalShards,
+      shardConfig,
+      reducer,
+      args: task.args || {},
+    });
+
     touchJob(parentJob);
     return parentJob;
   }
@@ -693,9 +771,20 @@ function createStore(options = {}) {
   }
 
   function failParentAndStopChildren(parentJob, reason) {
+    const wasTerminal = parentJob.status === "failed" || parentJob.status === "done";
     parentJob.status = "failed";
     parentJob.error = reason;
     touchJob(parentJob);
+    if (!wasTerminal) {
+      appendJobEvent(parentJob.jobId, {
+        type: "job_failed",
+        jobId: parentJob.jobId,
+        reason,
+        completedShards: Number(parentJob.completedShards || 0),
+        failedShards: Number(parentJob.failedShards || 0),
+        totalShards: Number(parentJob.totalShards || 0),
+      });
+    }
 
     if (!Array.isArray(parentJob.childJobIds)) {
       return;
@@ -775,6 +864,18 @@ function createStore(options = {}) {
         return { ok: true };
       }
       parentJob.completedShards += 1;
+      appendJobEvent(parentJob.jobId, {
+        type: "shard_done",
+        parentJobId: parentJob.jobId,
+        childJobId: job.jobId,
+        workerId,
+        shardIndex: Number.isInteger(job.shardIndex) ? job.shardIndex : null,
+        totalShards: Number(parentJob.totalShards || 0),
+        completedShards: Number(parentJob.completedShards || 0),
+        failedShards: Number(parentJob.failedShards || 0),
+        shardContext: job.shardContextBase || null,
+        result: normalizeResultForLiveEvent(normalizedResult),
+      });
       if (parentJob.completedShards >= parentJob.totalShards) {
         const finalResult = {
           reducer: parentJob.reducer,
@@ -801,6 +902,14 @@ function createStore(options = {}) {
         parentJob.status = "done";
         parentJob.result = finalResult;
         parentJob.error = null;
+        appendJobEvent(parentJob.jobId, {
+          type: "job_done",
+          jobId: parentJob.jobId,
+          completedShards: Number(parentJob.completedShards || 0),
+          failedShards: Number(parentJob.failedShards || 0),
+          totalShards: Number(parentJob.totalShards || 0),
+          result: finalResult,
+        });
       }
       touchJob(parentJob);
     }
@@ -845,6 +954,17 @@ function createStore(options = {}) {
       const parentJob = jobs.get(job.parentJobId);
       if (parentJob && parentJob.status !== "failed" && parentJob.status !== "done") {
         parentJob.failedShards += 1;
+        appendJobEvent(parentJob.jobId, {
+          type: "shard_failed",
+          parentJobId: parentJob.jobId,
+          childJobId: job.jobId,
+          workerId,
+          shardIndex: Number.isInteger(job.shardIndex) ? job.shardIndex : null,
+          totalShards: Number(parentJob.totalShards || 0),
+          completedShards: Number(parentJob.completedShards || 0),
+          failedShards: Number(parentJob.failedShards || 0),
+          error,
+        });
         failParentAndStopChildren(
           parentJob,
           `Shard ${job.shardIndex} failed after ${job.attempt}/${job.maxAttempts} attempts: ${error}`,
@@ -1016,6 +1136,7 @@ function createStore(options = {}) {
     removeWorkerSocket,
     listWorkers,
     getWorkerMetricsSnapshot,
+    getJobEvents,
     maxCustomResultBytes,
   };
 }

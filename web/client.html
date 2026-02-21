@@ -217,6 +217,26 @@
         align-items: center;
         overflow-wrap: anywhere;
       }
+      .raytrace-panel {
+        border: 1px solid #35507a;
+        border-radius: 10px;
+        padding: 0.75rem;
+        background: #101d39;
+        display: grid;
+        gap: 0.6rem;
+      }
+      .raytrace-grid {
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+      }
+      .raytrace-actions {
+        display: grid;
+        grid-template-columns: auto auto minmax(0, 1fr);
+        gap: 0.6rem;
+        align-items: center;
+      }
+      .raytrace-link {
+        color: #9fd9ff;
+      }
       button {
         background: var(--accent);
         color: #001219;
@@ -306,6 +326,10 @@
         .row,
         .script-options-row,
         .file-picker {
+          grid-template-columns: 1fr;
+        }
+        .raytrace-grid,
+        .raytrace-actions {
           grid-template-columns: 1fr;
         }
       }
@@ -479,6 +503,40 @@ for (let i = 0; i &lt; 100000000; i += 1) {
 return hits;</pre>
             <p class="hint">Reducer tips: <span class="mono">sum</span> for counts/math, <span class="mono">collect</span> for per-shard outputs, <span class="mono">min/max</span> for optimization jobs.</p>
           </div>
+          <div class="raytrace-panel">
+            <strong>Live Raytrace (Cluster Progressive)</strong>
+            <div class="script-options-row raytrace-grid">
+              <div class="setting-cell">
+                <label class="setting-label" for="rayWidth">Width</label>
+                <input id="rayWidth" type="number" min="64" step="1" value="320" />
+              </div>
+              <div class="setting-cell">
+                <label class="setting-label" for="rayHeight">Height</label>
+                <input id="rayHeight" type="number" min="64" step="1" value="180" />
+              </div>
+              <div class="setting-cell">
+                <label class="setting-label" for="rayTileSize">Tile</label>
+                <input id="rayTileSize" type="number" min="4" step="1" value="16" />
+              </div>
+              <div class="setting-cell">
+                <label class="setting-label" for="raySamplesPerShard">SPP / Shard</label>
+                <input id="raySamplesPerShard" type="number" min="1" step="1" value="2" />
+              </div>
+              <div class="setting-cell">
+                <label class="setting-label" for="rayPasses">Passes</label>
+                <input id="rayPasses" type="number" min="1" step="1" value="40" />
+              </div>
+              <div class="setting-cell">
+                <label class="setting-label" for="rayMaxBounces">Bounces</label>
+                <input id="rayMaxBounces" type="number" min="1" step="1" value="3" />
+              </div>
+            </div>
+            <div class="raytrace-actions">
+              <button id="startRaytraceBtn" class="warn" type="button">Start Live Raytrace + Open Viewer</button>
+              <a id="openRaytraceViewerLink" class="mono raytrace-link" href="#" target="_blank" rel="noopener">Open Raytrace Viewer</a>
+              <span id="raytraceHint" class="hint mono">Viewer waits for shard events and refines image in real time.</span>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -540,6 +598,15 @@ return hits;</pre>
       const parallelGuidePanelEl = document.getElementById("parallelGuidePanel");
       const openGuidePageLinkEl = document.getElementById("openGuidePageLink");
       const submitScriptBtn = document.getElementById("submitScriptBtn");
+      const rayWidthEl = document.getElementById("rayWidth");
+      const rayHeightEl = document.getElementById("rayHeight");
+      const rayTileSizeEl = document.getElementById("rayTileSize");
+      const raySamplesPerShardEl = document.getElementById("raySamplesPerShard");
+      const rayPassesEl = document.getElementById("rayPasses");
+      const rayMaxBouncesEl = document.getElementById("rayMaxBounces");
+      const startRaytraceBtnEl = document.getElementById("startRaytraceBtn");
+      const openRaytraceViewerLinkEl = document.getElementById("openRaytraceViewerLink");
+      const raytraceHintEl = document.getElementById("raytraceHint");
 
       const taskTypeEl = document.getElementById("taskType");
       const executionModelEl = document.getElementById("executionModel");
@@ -551,10 +618,264 @@ return hits;</pre>
       const SHARD_MIN_UNITS = 1;
       const SHARD_MAX_PER_WORKER = 200;
       const SHARD_ABSOLUTE_MAX = Number.MAX_SAFE_INTEGER;
+      const RAYTRACE_VIEWER_HTML_PATH = "/raytrace-viewer.html";
 
       let currentJobId = null;
       let pollTimer = null;
       let workersTimer = null;
+
+      function raytraceViewerUrl(jobId) {
+        const base = withBase(RAYTRACE_VIEWER_HTML_PATH);
+        if (!jobId) {
+          return base;
+        }
+        return `${base}?jobId=${encodeURIComponent(jobId)}`;
+      }
+
+      function updateRaytraceViewerLink() {
+        openRaytraceViewerLinkEl.href = raytraceViewerUrl(currentJobId);
+        if (currentJobId) {
+          raytraceHintEl.textContent = `Live viewer ready for job ${currentJobId}`;
+          raytraceHintEl.className = "hint mono ok";
+        } else {
+          raytraceHintEl.textContent = "Viewer waits for shard events and refines image in real time.";
+          raytraceHintEl.className = "hint mono";
+        }
+      }
+
+      function clampInt(value, minValue, maxValue, fallback) {
+        const n = Number(value);
+        if (!Number.isInteger(n)) {
+          return fallback;
+        }
+        return Math.max(minValue, Math.min(maxValue, n));
+      }
+
+      function getRaytraceSettings() {
+        const width = clampInt(rayWidthEl.value, 64, 1920, 320);
+        const height = clampInt(rayHeightEl.value, 64, 1080, 180);
+        const tileSize = clampInt(rayTileSizeEl.value, 4, 128, 16);
+        const samplesPerShard = clampInt(raySamplesPerShardEl.value, 1, 128, 2);
+        const passes = clampInt(rayPassesEl.value, 1, 20000, 40);
+        const maxBounces = clampInt(rayMaxBouncesEl.value, 1, 8, 3);
+        return {
+          width,
+          height,
+          tileSize,
+          samplesPerShard,
+          passes,
+          maxBounces,
+        };
+      }
+
+      function buildRaytraceScript() {
+        return `const brain = globalThis.__BRAIN__ || {};
+const cfg = args && typeof args === "object" ? args : {};
+const width = Math.max(64, Math.min(1920, Number(cfg.width) || 320)) | 0;
+const height = Math.max(64, Math.min(1080, Number(cfg.height) || 180)) | 0;
+const tileSize = Math.max(4, Math.min(128, Number(cfg.tileSize) || 16)) | 0;
+const spp = Math.max(1, Math.min(128, Number(cfg.samplesPerShard) || 2)) | 0;
+const maxBounces = Math.max(1, Math.min(8, Number(cfg.maxBounces) || 3)) | 0;
+const shardOrdinal = Math.max(0, Math.floor(Number.isFinite(Number(brain.offset)) ? Number(brain.offset) : Number(brain.shardId || 0)));
+const tilesX = Math.ceil(width / tileSize);
+const tilesY = Math.ceil(height / tileSize);
+const totalTiles = Math.max(1, tilesX * tilesY);
+const tileIndex = shardOrdinal % totalTiles;
+const passIndex = Math.floor(shardOrdinal / totalTiles);
+const tileX = (tileIndex % tilesX) * tileSize;
+const tileY = Math.floor(tileIndex / tilesX) * tileSize;
+const tileW = Math.min(tileSize, width - tileX);
+const tileH = Math.min(tileSize, height - tileY);
+
+function makeRng(seed) {
+  let s = (seed >>> 0) || 1;
+  return function rand() {
+    s = (1664525 * s + 1013904223) >>> 0;
+    return (s & 0x00ffffff) / 0x01000000;
+  };
+}
+function dot(ax, ay, az, bx, by, bz) { return ax * bx + ay * by + az * bz; }
+function len(x, y, z) { return Math.sqrt(dot(x, y, z, x, y, z)); }
+function normalize(x, y, z) {
+  const l = len(x, y, z) || 1;
+  return [x / l, y / l, z / l];
+}
+function sphereHit(ro, rd, cx, cy, cz, r) {
+  const ocx = ro[0] - cx, ocy = ro[1] - cy, ocz = ro[2] - cz;
+  const b = dot(ocx, ocy, ocz, rd[0], rd[1], rd[2]);
+  const c = dot(ocx, ocy, ocz, ocx, ocy, ocz) - r * r;
+  const h = b * b - c;
+  if (h < 0) return null;
+  const t = -b - Math.sqrt(h);
+  if (t <= 1e-4) return null;
+  const px = ro[0] + rd[0] * t, py = ro[1] + rd[1] * t, pz = ro[2] + rd[2] * t;
+  const nn = normalize(px - cx, py - cy, pz - cz);
+  return { t, px, py, pz, nx: nn[0], ny: nn[1], nz: nn[2] };
+}
+function scene(ro, rd) {
+  let best = null;
+  function keep(hit, albedo) {
+    if (!hit) return;
+    if (!best || hit.t < best.t) {
+      best = { ...hit, albedo };
+    }
+  }
+  keep(sphereHit(ro, rd, 0.0, 0.9, 0.0, 0.9), [0.95, 0.32, 0.28]);
+  keep(sphereHit(ro, rd, -1.6, 0.65, -0.3, 0.65), [0.25, 0.52, 0.95]);
+  keep(sphereHit(ro, rd, 1.55, 0.55, 0.3, 0.55), [0.88, 0.84, 0.3]);
+
+  if (Math.abs(rd[1]) > 1e-6) {
+    const tPlane = -ro[1] / rd[1];
+    if (tPlane > 1e-4 && (!best || tPlane < best.t)) {
+      const px = ro[0] + rd[0] * tPlane;
+      const pz = ro[2] + rd[2] * tPlane;
+      const checker = (((Math.floor(px) + Math.floor(pz)) & 1) === 0) ? 0.85 : 0.22;
+      best = {
+        t: tPlane,
+        px,
+        py: 0,
+        pz,
+        nx: 0,
+        ny: 1,
+        nz: 0,
+        albedo: [checker, checker, checker],
+      };
+    }
+  }
+  return best;
+}
+function cosineHemisphere(nx, ny, nz, rng) {
+  const u = rng();
+  const v = rng();
+  const r = Math.sqrt(u);
+  const theta = 2 * Math.PI * v;
+  const x = r * Math.cos(theta);
+  const y = r * Math.sin(theta);
+  const z = Math.sqrt(Math.max(0, 1 - u));
+  const upx = Math.abs(ny) < 0.999 ? 0 : 1;
+  const upy = Math.abs(ny) < 0.999 ? 1 : 0;
+  const upz = 0;
+  let tx = ny * upz - nz * upy;
+  let ty = nz * upx - nx * upz;
+  let tz = nx * upy - ny * upx;
+  const tl = len(tx, ty, tz) || 1;
+  tx /= tl; ty /= tl; tz /= tl;
+  const bx = ny * tz - nz * ty;
+  const by = nz * tx - nx * tz;
+  const bz = nx * ty - ny * tx;
+  return normalize(tx * x + bx * y + nx * z, ty * x + by * y + ny * z, tz * x + bz * y + nz * z);
+}
+function sky(dirY) {
+  const t = Math.max(0, Math.min(1, 0.5 * (dirY + 1)));
+  return [0.35 + 0.45 * t, 0.45 + 0.4 * t, 0.62 + 0.33 * t];
+}
+function trace(ro, rd, rng, bounces) {
+  let thrR = 1, thrG = 1, thrB = 1;
+  let outR = 0, outG = 0, outB = 0;
+  const sun = normalize(1, 1.25, 0.65);
+  for (let bounce = 0; bounce < bounces; bounce += 1) {
+    const hit = scene(ro, rd);
+    if (!hit) {
+      const s = sky(rd[1]);
+      outR += thrR * s[0];
+      outG += thrG * s[1];
+      outB += thrB * s[2];
+      break;
+    }
+    const eps = 1e-3;
+    const sro = [hit.px + hit.nx * eps, hit.py + hit.ny * eps, hit.pz + hit.nz * eps];
+    const shadow = scene(sro, sun);
+    const visible = !shadow || shadow.t > 50;
+    if (visible) {
+      const ndotl = Math.max(0, dot(hit.nx, hit.ny, hit.nz, sun[0], sun[1], sun[2]));
+      const intensity = 0.9 * ndotl;
+      outR += thrR * hit.albedo[0] * intensity;
+      outG += thrG * hit.albedo[1] * intensity;
+      outB += thrB * hit.albedo[2] * intensity;
+    }
+    thrR *= hit.albedo[0];
+    thrG *= hit.albedo[1];
+    thrB *= hit.albedo[2];
+    if (bounce >= 2) {
+      const p = Math.max(thrR, thrG, thrB);
+      if (rng() > p) break;
+      const inv = p > 0 ? 1 / p : 1;
+      thrR *= inv; thrG *= inv; thrB *= inv;
+    }
+    const next = cosineHemisphere(hit.nx, hit.ny, hit.nz, rng);
+    ro = sro;
+    rd = next;
+  }
+  return [outR, outG, outB];
+}
+
+const camPos = [0, 1.15, 4.1];
+const camTarget = [0, 0.82, 0];
+const forward = normalize(camTarget[0] - camPos[0], camTarget[1] - camPos[1], camTarget[2] - camPos[2]);
+const right = normalize(forward[2], 0, -forward[0]);
+const up = normalize(
+  right[1] * forward[2] - right[2] * forward[1],
+  right[2] * forward[0] - right[0] * forward[2],
+  right[0] * forward[1] - right[1] * forward[0],
+);
+const fov = 46 * Math.PI / 180;
+const invW = 1 / width;
+const invH = 1 / height;
+const aspect = width / height;
+const scale = Math.tan(fov * 0.5);
+
+const rgb8Sums = new Array(tileW * tileH * 3).fill(0);
+for (let py = 0; py < tileH; py += 1) {
+  for (let px = 0; px < tileW; px += 1) {
+    const gx = tileX + px;
+    const gy = tileY + py;
+    let sR = 0, sG = 0, sB = 0;
+    for (let s = 0; s < spp; s += 1) {
+      const seed =
+        ((passIndex + 1) * 73856093) ^
+        ((gx + 1) * 19349663) ^
+        ((gy + 1) * 83492791) ^
+        ((s + 17) * 2654435761);
+      const rng = makeRng(seed >>> 0);
+      const jx = (gx + rng()) * invW;
+      const jy = (gy + rng()) * invH;
+      const sx = (2 * jx - 1) * aspect * scale;
+      const sy = (1 - 2 * jy) * scale;
+      const dir = normalize(
+        forward[0] + right[0] * sx + up[0] * sy,
+        forward[1] + right[1] * sx + up[1] * sy,
+        forward[2] + right[2] * sx + up[2] * sy,
+      );
+      const c = trace([camPos[0], camPos[1], camPos[2]], dir, rng, maxBounces);
+      const gR = Math.pow(Math.max(0, Math.min(1, c[0])), 1 / 2.2);
+      const gG = Math.pow(Math.max(0, Math.min(1, c[1])), 1 / 2.2);
+      const gB = Math.pow(Math.max(0, Math.min(1, c[2])), 1 / 2.2);
+      sR += Math.round(gR * 255);
+      sG += Math.round(gG * 255);
+      sB += Math.round(gB * 255);
+    }
+    const off = (py * tileW + px) * 3;
+    rgb8Sums[off] = sR;
+    rgb8Sums[off + 1] = sG;
+    rgb8Sums[off + 2] = sB;
+  }
+}
+
+return {
+  mode: "raytrace_tile_v1",
+  width,
+  height,
+  tileX,
+  tileY,
+  tileW,
+  tileH,
+  passIndex,
+  samplesPerPixel: spp,
+  rgb8Sums,
+  shardsDone: 1,
+  samplesDone: tileW * tileH * spp,
+};`;
+      }
 
       function getToken() {
         return (clientTokenEl.value || "").trim();
@@ -682,6 +1003,7 @@ return hits;</pre>
       function setBusy(isBusy) {
         submitAddBtn.disabled = isBusy;
         submitScriptBtn.disabled = isBusy;
+        startRaytraceBtnEl.disabled = isBusy;
       }
 
       function detectExecutionModelFromInputs() {
@@ -891,6 +1213,7 @@ return hits;</pre>
           currentJobId = data.jobId;
           jobIdEl.textContent = currentJobId;
           setStatus(data.status);
+          updateRaytraceViewerLink();
 
           if (pollTimer) {
             clearInterval(pollTimer);
@@ -899,10 +1222,12 @@ return hits;</pre>
             pollJob(currentJobId);
           }, 800);
           pollJob(currentJobId);
+          return data;
         } catch (err) {
           setStatus("failed");
           errorEl.textContent = err.message;
           setBusy(false);
+          return null;
         }
       }
 
@@ -954,6 +1279,40 @@ return hits;</pre>
         const a = Number(inputA.value);
         const b = Number(inputB.value);
         await submitAndPoll("/api/jobs", { a, b });
+      });
+
+      startRaytraceBtnEl.addEventListener("click", async () => {
+        const workerCount = getConnectedWorkerCount();
+        if (workerCount !== null && workerCount < 2) {
+          errorEl.textContent = "Live raytrace needs at least 2 connected workers.";
+          return;
+        }
+
+        const settings = getRaytraceSettings();
+        const tilesX = Math.ceil(settings.width / settings.tileSize);
+        const tilesY = Math.ceil(settings.height / settings.tileSize);
+        const totalShards = Math.max(1, tilesX * tilesY * settings.passes);
+        const payload = {
+          code: buildRaytraceScript(),
+          args: settings,
+          executionModel: "sharded",
+          shardConfig: {
+            totalUnits: totalShards,
+            unitsPerShard: 1,
+          },
+          reducer: {
+            type: "sum",
+            fields: ["shardsDone", "samplesDone"],
+          },
+          timeoutMs: 0,
+        };
+
+        const created = await submitAndPoll("/api/jobs/run-js", payload);
+        if (!created || !created.jobId) {
+          return;
+        }
+        const viewerUrl = raytraceViewerUrl(created.jobId);
+        window.open(viewerUrl, "_blank", "noopener");
       });
 
       submitScriptBtn.addEventListener("click", async () => {
@@ -1064,6 +1423,8 @@ return hits;</pre>
         });
       }
       openGuidePageLinkEl.href = withBase("/parallel-guide.html");
+      openRaytraceViewerLinkEl.href = raytraceViewerUrl(null);
+      updateRaytraceViewerLink();
       refreshAutoModeUi();
       refreshReducerUi();
     </script>

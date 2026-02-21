@@ -39,6 +39,7 @@ const SHARD_MIN_UNITS = Math.max(parsePositiveInt(process.env.SHARD_MIN_UNITS, 1
 const SHARD_MAX_PER_WORKER = Math.max(parsePositiveInt(process.env.SHARD_MAX_PER_WORKER, 200), 1);
 const SHARD_ABSOLUTE_MAX = Math.max(parsePositiveInt(process.env.SHARD_ABSOLUTE_MAX, Number.MAX_SAFE_INTEGER), 100);
 const WORKER_MAX_CONCURRENT_JOBS = Math.max(parsePositiveInt(process.env.WORKER_MAX_CONCURRENT_JOBS, 8), 1);
+const JOB_EVENT_BUFFER_SIZE = Math.max(parsePositiveInt(process.env.JOB_EVENT_BUFFER_SIZE, 4000), 100);
 
 function normalizeBasePath(input) {
   if (!input || input === "/") {
@@ -80,6 +81,7 @@ const API_BASE_PATH = withBasePath("/api");
 const WS_WORKER_PATH = withBasePath("/ws/worker");
 const CLIENT_PATH = withBasePath("/client");
 const WORKER_PATH = withBasePath("/worker");
+const RAYTRACE_VIEWER_PATH = withBasePath("/raytrace-viewer");
 const SHORT_INVITE_PATH = withBasePath("/j");
 const PHRASE_INVITE_PATH = withBasePath("/p");
 const APP_ROOT_PATH = BASE_PATH || "/";
@@ -91,6 +93,7 @@ const app = express();
 const store = createStore({
   maxCustomResultBytes: config.customJobMaxResultBytes,
   maxWorkerSlots: WORKER_MAX_CONCURRENT_JOBS,
+  maxJobEventBufferSize: JOB_EVENT_BUFFER_SIZE,
 });
 const dispatcher = createDispatcher(store, auth, console);
 const shortInvites = new Map();
@@ -320,6 +323,14 @@ app.get(withBasePath("/parallel-guide.html"), (_req, res) => {
   res.sendFile(path.join(__dirname, "..", "web", "parallel-guide.html"));
 });
 
+app.get(RAYTRACE_VIEWER_PATH, (_req, res) => {
+  res.sendFile(path.join(__dirname, "..", "web", "raytrace-viewer.html"));
+});
+
+app.get(withBasePath("/raytrace-viewer.html"), (_req, res) => {
+  res.sendFile(path.join(__dirname, "..", "web", "raytrace-viewer.html"));
+});
+
 app.get(withBasePath("/j/:code"), (req, res) => {
   pruneExpiredShortInvites();
   const code = String(req.params.code || "").toLowerCase();
@@ -504,6 +515,32 @@ app.get(withBasePath("/api/jobs/:jobId"), auth.requireClientAuth, (req, res) => 
     task: summarizeTask(job),
     result: job.result,
     error: job.error,
+  });
+});
+
+app.get(withBasePath("/api/jobs/:jobId/events"), auth.requireClientAuth, (req, res) => {
+  const { jobId } = req.params;
+  const job = store.getJob(jobId);
+  if (!job) {
+    return res.status(404).json({ error: "Job not found." });
+  }
+  if ((job.executionModel || "single") !== "sharded") {
+    return res.status(400).json({ error: "Live events are only available for sharded jobs." });
+  }
+
+  const afterRaw = Array.isArray(req.query.after) ? req.query.after[0] : req.query.after;
+  const limitRaw = Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit;
+  const after = Number.isSafeInteger(Number(afterRaw)) && Number(afterRaw) >= 0 ? Number(afterRaw) : 0;
+  const limit = Number.isSafeInteger(Number(limitRaw)) && Number(limitRaw) > 0 ? Number(limitRaw) : 64;
+  const slice = store.getJobEvents(jobId, after, limit);
+
+  return res.json({
+    jobId: job.jobId,
+    status: job.status,
+    executionModel: job.executionModel || "single",
+    shardConfig: job.shardConfig || null,
+    reducer: job.reducer || null,
+    ...slice,
   });
 });
 
