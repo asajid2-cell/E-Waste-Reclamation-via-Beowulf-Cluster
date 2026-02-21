@@ -1,0 +1,122 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cluster Parallel Guide</title>
+    <style>
+      :root {
+        --bg: #0a1128;
+        --card: #1b263b;
+        --text: #f8f9fa;
+        --muted: #c2cde3;
+        --accent: #00b4d8;
+      }
+      body {
+        margin: 0;
+        font-family: "Segoe UI", Tahoma, sans-serif;
+        color: var(--text);
+        background: radial-gradient(circle at 20% 10%, #1f3f7a, var(--bg) 50%);
+        min-height: 100vh;
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 2rem auto;
+        padding: 1rem;
+      }
+      .card {
+        background: color-mix(in srgb, var(--card) 90%, black);
+        border: 1px solid #35507a;
+        border-radius: 12px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+      }
+      h1,
+      h2 {
+        margin: 0 0 0.6rem 0;
+      }
+      p,
+      li {
+        color: var(--muted);
+      }
+      pre {
+        margin: 0.6rem 0;
+        background: #0d1730;
+        border: 1px solid #365684;
+        border-radius: 8px;
+        padding: 0.7rem;
+        overflow: auto;
+        color: var(--text);
+      }
+      code {
+        font-family: Consolas, Menlo, monospace;
+      }
+      a {
+        color: var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>Parallelizable Script Guide</h1>
+        <p>The client auto-resolves execution model from shard fields:</p>
+        <ul>
+          <li>Leave both shard fields empty: <code>single</code></li>
+          <li>Fill both shard fields: <code>sharded</code></li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h2>Good vs Bad</h2>
+        <p>Bad (hardcoded workload):</p>
+        <pre><code>let hits = 0;
+for (let i = 0; i &lt; 100_000_000; i += 1) {
+  const x = Math.random();
+  const y = Math.random();
+  if (x * x + y * y &lt;= 1) hits += 1;
+}
+return hits;</code></pre>
+        <p>Good (slice-aware):</p>
+        <pre><code>const units = Number(globalThis.__BRAIN__?.units || args.samples || 1_000_000);
+let hits = 0;
+for (let i = 0; i &lt; units; i += 1) {
+  const x = Math.random();
+  const y = Math.random();
+  if (x * x + y * y &lt;= 1) hits += 1;
+}
+return { hits, samples: units };</code></pre>
+      </div>
+
+      <div class="card">
+        <h2>Pi Example</h2>
+        <pre><code>const units = Number(globalThis.__BRAIN__?.units || 10_000_000);
+let hits = 0;
+for (let i = 0; i &lt; units; i += 1) {
+  const x = Math.random();
+  const y = Math.random();
+  if (x * x + y * y &lt;= 1) hits += 1;
+}
+return { hits, samples: units };</code></pre>
+        <p>Use:</p>
+        <ul>
+          <li><code>total units=100000000</code></li>
+          <li><code>units per shard=10000000</code></li>
+          <li><code>reducer=sum</code></li>
+          <li><code>sum fields=hits,samples</code></li>
+        </ul>
+        <pre><code>pi ~= 4 * (aggregate.hits / aggregate.samples)</code></pre>
+      </div>
+
+      <div class="card">
+        <h2>Reducers</h2>
+        <ul>
+          <li><code>sum</code>: add numeric fields from each shard result.</li>
+          <li><code>collect</code>: gather all shard outputs.</li>
+          <li><code>min</code>/<code>max</code>: select by one numeric field.</li>
+        </ul>
+        <p><a href="/cluster/client">Back to client</a></p>
+      </div>
+    </div>
+  </body>
+</html>

@@ -79,6 +79,7 @@
         overflow-wrap: anywhere;
       }
       input,
+      select,
       button,
       textarea {
         border-radius: 8px;
@@ -87,9 +88,50 @@
         font-size: 0.95rem;
       }
       input,
+      select,
       textarea {
         background: #0e1a35;
         color: var(--text);
+      }
+      .hidden {
+        display: none !important;
+      }
+      .guide-link-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 0.6rem;
+        flex-wrap: wrap;
+      }
+      .hint {
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+      .guide-code {
+        margin: 0;
+        background: #0d1730;
+        border: 1px solid #365684;
+        border-radius: 8px;
+        padding: 0.7rem;
+        color: var(--text);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .guide-panel {
+        border: 1px solid #35507a;
+        border-radius: 10px;
+        padding: 0.8rem;
+        background: #101d39;
+      }
+      .guide-panel h3 {
+        margin: 0;
+        font-size: 1rem;
+      }
+      .script-inline-note {
+        color: var(--muted);
+        font-size: 0.85rem;
+        display: flex;
+        align-items: center;
       }
       button {
         background: var(--accent);
@@ -228,9 +270,48 @@ console.log('estimated pi:', pi);
 return { samples, hits, pi };"
           ></textarea>
           <div class="script-options-row">
-            <input id="scriptArgs" class="mono" placeholder='args JSON (optional), e.g. {"samples":10000000}' />
             <input id="scriptTimeoutMs" type="number" min="200" step="100" placeholder="run timeout ms (optional)" />
             <button id="submitScriptBtn" type="button">Run Script</button>
+            <span id="autoModeHint" class="hint mono">Mode: auto single (default)</span>
+          </div>
+          <div class="script-options-row">
+            <input id="shardTotalUnits" type="number" min="1" step="1" placeholder="total units (e.g. 100000000)" />
+            <input id="shardUnitsPerShard" type="number" min="1" step="1" placeholder="units per shard (e.g. 10000000)" />
+            <select id="shardReducer">
+              <option value="sum">Reducer: SUM</option>
+              <option value="collect">Reducer: COLLECT</option>
+              <option value="min">Reducer: MIN</option>
+              <option value="max">Reducer: MAX</option>
+            </select>
+          </div>
+          <div class="script-options-row">
+            <input id="shardSumFields" class="mono" placeholder="sum fields (comma-separated), e.g. hits,samples" />
+            <input id="scriptArgs" class="mono" placeholder='args JSON (optional), e.g. {"samples":10000000}' />
+            <div class="script-inline-note">For <span class="mono">&nbsp;sum&nbsp;</span> reducer, default fields are <span class="mono">&nbsp;hits,samples</span>.</div>
+          </div>
+          <div class="guide-link-row">
+            <button id="toggleParallelGuideBtn" class="secondary" type="button">Show Parallel Guide</button>
+            <a id="openGuidePageLink" class="mono" href="#" target="_blank" rel="noopener">Open Full Guide</a>
+          </div>
+          <div id="parallelGuidePanel" class="guide-panel hidden">
+            <h3>How To Write Parallelizable Scripts</h3>
+            <p class="hint">Mode auto-resolve: leave shard fields empty for single-worker; fill both shard fields for sharded cluster execution.</p>
+            <p class="hint">Good pattern (slice-aware):</p>
+            <pre class="guide-code">const units = Number(globalThis.__BRAIN__?.units || 1_000_000);
+let hits = 0;
+for (let i = 0; i &lt; units; i += 1) {
+  const x = Math.random();
+  const y = Math.random();
+  if (x * x + y * y &lt;= 1) hits += 1;
+}
+return { hits, samples: units };</pre>
+            <p class="hint">Bad pattern (hardcoded non-scalable work):</p>
+            <pre class="guide-code">let hits = 0;
+for (let i = 0; i &lt; 100000000; i += 1) {
+  // hardcoded total means one huge shard and poor scaling
+}
+return hits;</pre>
+            <p class="hint">Reducer tips: <span class="mono">sum</span> for counts/math, <span class="mono">collect</span> for per-shard outputs, <span class="mono">min/max</span> for optimization jobs.</p>
           </div>
         </div>
       </div>
@@ -238,6 +319,7 @@ return { samples, hits, pi };"
       <div class="card">
         <p class="line">Job ID: <span class="mono" id="jobId">-</span></p>
         <p class="line">Task Type: <strong id="taskType">-</strong></p>
+        <p class="line">Execution: <strong id="executionModel">-</strong></p>
         <p class="line">Status: <strong id="status">idle</strong></p>
         <p class="line">Result: <span class="mono" id="result">-</span></p>
         <p class="line">Error: <span id="error">-</span></p>
@@ -283,9 +365,18 @@ return { samples, hits, pi };"
       const scriptCodeEl = document.getElementById("scriptCode");
       const scriptArgsEl = document.getElementById("scriptArgs");
       const scriptTimeoutMsEl = document.getElementById("scriptTimeoutMs");
+      const autoModeHintEl = document.getElementById("autoModeHint");
+      const shardTotalUnitsEl = document.getElementById("shardTotalUnits");
+      const shardUnitsPerShardEl = document.getElementById("shardUnitsPerShard");
+      const shardReducerEl = document.getElementById("shardReducer");
+      const shardSumFieldsEl = document.getElementById("shardSumFields");
+      const toggleParallelGuideBtnEl = document.getElementById("toggleParallelGuideBtn");
+      const parallelGuidePanelEl = document.getElementById("parallelGuidePanel");
+      const openGuidePageLinkEl = document.getElementById("openGuidePageLink");
       const submitScriptBtn = document.getElementById("submitScriptBtn");
 
       const taskTypeEl = document.getElementById("taskType");
+      const executionModelEl = document.getElementById("executionModel");
       const jobIdEl = document.getElementById("jobId");
       const statusEl = document.getElementById("status");
       const resultEl = document.getElementById("result");
@@ -423,6 +514,40 @@ return { samples, hits, pi };"
         submitScriptBtn.disabled = isBusy;
       }
 
+      function detectExecutionModelFromInputs() {
+        const hasTotalUnits = shardTotalUnitsEl.value.trim().length > 0;
+        const hasUnitsPerShard = shardUnitsPerShardEl.value.trim().length > 0;
+        if (hasTotalUnits && hasUnitsPerShard) {
+          return "sharded";
+        }
+        if (!hasTotalUnits && !hasUnitsPerShard) {
+          return "single";
+        }
+        return "invalid";
+      }
+
+      function refreshAutoModeUi() {
+        const model = detectExecutionModelFromInputs();
+        if (model === "single") {
+          autoModeHintEl.textContent = "Mode: auto single (default)";
+          autoModeHintEl.className = "hint mono";
+          shardReducerEl.disabled = true;
+          shardSumFieldsEl.disabled = true;
+          return;
+        }
+        if (model === "sharded") {
+          autoModeHintEl.textContent = "Mode: auto sharded";
+          autoModeHintEl.className = "hint mono ok";
+          shardReducerEl.disabled = false;
+          shardSumFieldsEl.disabled = false;
+          return;
+        }
+        autoModeHintEl.textContent = "Mode: invalid shard setup (set both shard fields or clear both)";
+        autoModeHintEl.className = "hint mono warn-text";
+        shardReducerEl.disabled = false;
+        shardSumFieldsEl.disabled = false;
+      }
+
       function clearInviteQr() {
         inviteQrEl.src = "";
         inviteQrEl.style.display = "none";
@@ -483,6 +608,7 @@ return { samples, hits, pi };"
           const data = await apiFetch(withBase(`/api/jobs/${jobId}`));
           setStatus(data.status);
           taskTypeEl.textContent = data.task && data.task.op ? data.task.op : "-";
+          executionModelEl.textContent = data.executionModel || (data.task && data.task.executionModel) || "-";
           resultEl.textContent = formatResult(data.result);
           errorEl.textContent = data.error == null ? "-" : data.error;
 
@@ -502,6 +628,7 @@ return { samples, hits, pi };"
         errorEl.textContent = "-";
         resultEl.textContent = "-";
         taskTypeEl.textContent = "-";
+        executionModelEl.textContent = "-";
         setStatus("queued");
 
         try {
@@ -586,7 +713,12 @@ return { samples, hits, pi };"
           return;
         }
 
-        const body = { code };
+        const executionModel = detectExecutionModelFromInputs();
+        if (executionModel === "invalid") {
+          errorEl.textContent = "Set both shard fields for sharded mode, or leave both empty for single mode.";
+          return;
+        }
+        const body = { code, executionModel };
         const rawArgs = scriptArgsEl.value.trim();
         if (rawArgs) {
           try {
@@ -596,6 +728,38 @@ return { samples, hits, pi };"
             return;
           }
         }
+
+        if (executionModel === "sharded") {
+          const totalUnits = Number(shardTotalUnitsEl.value);
+          const unitsPerShard = Number(shardUnitsPerShardEl.value);
+          if (!Number.isInteger(totalUnits) || totalUnits <= 0) {
+            errorEl.textContent = "total units must be a positive integer.";
+            return;
+          }
+          if (!Number.isInteger(unitsPerShard) || unitsPerShard <= 0) {
+            errorEl.textContent = "units per shard must be a positive integer.";
+            return;
+          }
+          body.shardConfig = { totalUnits, unitsPerShard };
+
+          const reducerType = shardReducerEl.value;
+          if (reducerType === "sum") {
+            const fields = (shardSumFieldsEl.value || "hits,samples")
+              .split(",")
+              .map((v) => v.trim())
+              .filter(Boolean);
+            if (fields.length === 0) {
+              errorEl.textContent = "sum reducer needs at least one field.";
+              return;
+            }
+            body.reducer = { type: "sum", fields };
+          } else if (reducerType === "collect") {
+            body.reducer = { type: "collect" };
+          } else {
+            body.reducer = { type: reducerType, field: "value" };
+          }
+        }
+
         if (scriptTimeoutMsEl.value.trim()) {
           const timeoutMs = Number(scriptTimeoutMsEl.value);
           if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
@@ -605,6 +769,13 @@ return { samples, hits, pi };"
           body.timeoutMs = timeoutMs;
         }
         await submitAndPoll("/api/jobs/run-js", body);
+      });
+
+      shardTotalUnitsEl.addEventListener("input", refreshAutoModeUi);
+      shardUnitsPerShardEl.addEventListener("input", refreshAutoModeUi);
+      toggleParallelGuideBtnEl.addEventListener("click", () => {
+        const isNowHidden = parallelGuidePanelEl.classList.toggle("hidden");
+        toggleParallelGuideBtnEl.textContent = isNowHidden ? "Show Parallel Guide" : "Hide Parallel Guide";
       });
 
       scriptFileBtnEl.addEventListener("click", () => {
@@ -635,6 +806,8 @@ return { samples, hits, pi };"
           }
         });
       }
+      openGuidePageLinkEl.href = withBase("/parallel-guide.html");
+      refreshAutoModeUi();
     </script>
   </body>
 </html>

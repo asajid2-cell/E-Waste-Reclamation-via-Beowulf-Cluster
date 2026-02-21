@@ -114,6 +114,7 @@
     <script>
       const WORKER_ID_KEY = "cluster_worker_id";
       const MAX_RECONNECT_MS = 10_000;
+      const HEARTBEAT_INTERVAL_MS = 20_000;
       const MAX_CLOCK_SKEW_MS = 30_000;
       const DEFAULT_MAX_RESULT_BYTES = 64 * 1024;
       const BASE_PATH = (() => {
@@ -474,6 +475,7 @@ self.onmessage = async (event) => {
       let ws = null;
       let reconnectDelay = 500;
       let reconnectTimer = null;
+      let heartbeatTimer = null;
       let verifyKeyPromise = null;
       let maxResultBytes = DEFAULT_MAX_RESULT_BYTES;
       let wakeLockSentinel = null;
@@ -587,6 +589,20 @@ self.onmessage = async (event) => {
           connect();
         }, reconnectDelay);
         reconnectDelay = Math.min(Math.floor(reconnectDelay * 1.8), MAX_RECONNECT_MS);
+      }
+
+      function clearHeartbeat() {
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
+        }
+      }
+
+      function startHeartbeat() {
+        clearHeartbeat();
+        heartbeatTimer = setInterval(() => {
+          send({ type: "heartbeat", workerId });
+        }, HEARTBEAT_INTERVAL_MS);
       }
 
       async function loadVerifyKey() {
@@ -898,6 +914,7 @@ self.onmessage = async (event) => {
           appendLog(`connected to ${url}`);
           send({ type: "register", workerId });
           send({ type: "ready", workerId });
+          startHeartbeat();
         });
 
         ws.addEventListener("message", (event) => {
@@ -936,17 +953,23 @@ self.onmessage = async (event) => {
         });
 
         ws.addEventListener("close", (event) => {
+          clearHeartbeat();
           setConnectionState("disconnected");
           if (event.code === 1008) {
             appendLog(`disconnected (${event.code}); invite rejected or expired`);
             inviteErrorEl.textContent = "Invite rejected or expired. Request a fresh invite URL.";
             return;
           }
-          appendLog(`disconnected (${event.code}); retrying...`);
+          if (event.code === 1005) {
+            appendLog("disconnected (1005); connection dropped by network/proxy, retrying...");
+          } else {
+            appendLog(`disconnected (${event.code}); retrying...`);
+          }
           scheduleReconnect();
         });
 
         ws.addEventListener("error", () => {
+          clearHeartbeat();
           setConnectionState("disconnected");
           appendLog("socket error");
           try {

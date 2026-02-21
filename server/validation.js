@@ -1,4 +1,5 @@
 const MAX_JOB_LOOKUP_ID_LENGTH = 128;
+const MAX_SHARDS_PER_JOB = 5000;
 
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -64,6 +65,57 @@ function parseRunJsCreateBody(body, limits) {
     };
   }
 
+  const executionModelRaw = body.executionModel === undefined ? "single" : String(body.executionModel).trim().toLowerCase();
+  if (!["single", "sharded"].includes(executionModelRaw)) {
+    return { ok: false, error: "executionModel must be 'single' or 'sharded'." };
+  }
+
+  let shardConfig = null;
+  let reducer = null;
+  if (executionModelRaw === "sharded") {
+    if (!isPlainObject(body.shardConfig)) {
+      return { ok: false, error: "shardConfig is required for executionModel='sharded'." };
+    }
+    const totalUnits = Number(body.shardConfig.totalUnits);
+    const unitsPerShard = Number(body.shardConfig.unitsPerShard);
+    if (!Number.isInteger(totalUnits) || totalUnits <= 0) {
+      return { ok: false, error: "shardConfig.totalUnits must be a positive integer." };
+    }
+    if (!Number.isInteger(unitsPerShard) || unitsPerShard <= 0) {
+      return { ok: false, error: "shardConfig.unitsPerShard must be a positive integer." };
+    }
+    const totalShards = Math.ceil(totalUnits / unitsPerShard);
+    if (totalShards > MAX_SHARDS_PER_JOB) {
+      return { ok: false, error: `shard count exceeds limit (${MAX_SHARDS_PER_JOB}).` };
+    }
+    shardConfig = {
+      totalUnits,
+      unitsPerShard,
+      totalShards,
+    };
+
+    const reducerRaw = isPlainObject(body.reducer) ? body.reducer : {};
+    const reducerType = String(reducerRaw.type || "sum").trim().toLowerCase();
+    if (!["sum", "collect", "min", "max"].includes(reducerType)) {
+      return { ok: false, error: "reducer.type must be one of: sum, collect, min, max." };
+    }
+    if (reducerType === "sum") {
+      const fields = Array.isArray(reducerRaw.fields) ? reducerRaw.fields.map((v) => String(v).trim()).filter(Boolean) : ["hits", "samples"];
+      if (fields.length === 0) {
+        return { ok: false, error: "sum reducer requires a non-empty fields array." };
+      }
+      reducer = { type: "sum", fields };
+    } else if (reducerType === "collect") {
+      reducer = { type: "collect" };
+    } else {
+      const field = String(reducerRaw.field || "value").trim();
+      if (!field) {
+        return { ok: false, error: `${reducerType} reducer requires reducer.field.` };
+      }
+      reducer = { type: reducerType, field };
+    }
+  }
+
   return {
     ok: true,
     value: {
@@ -71,6 +123,9 @@ function parseRunJsCreateBody(body, limits) {
       code: body.code,
       args: JSON.parse(argsJson),
       timeoutMs,
+      executionModel: executionModelRaw,
+      shardConfig,
+      reducer,
     },
   };
 }
@@ -115,6 +170,11 @@ function parseWorkerMessage(message) {
   const { type, workerId, jobId, result, error } = message;
   switch (type) {
     case "register":
+      if (!isValidWorkerId(workerId)) {
+        return { ok: false, error: "Invalid workerId." };
+      }
+      return { ok: true, type, workerId };
+    case "heartbeat":
       if (!isValidWorkerId(workerId)) {
         return { ok: false, error: "Invalid workerId." };
       }

@@ -25,6 +25,8 @@ const WS_MAX_PAYLOAD = Number(process.env.WS_MAX_PAYLOAD || 256 * 1024);
 const WS_MAX_CONNECTIONS_PER_IP = Number(process.env.WS_MAX_CONNECTIONS_PER_IP || 20);
 const WS_MAX_MESSAGES_PER_WINDOW = Number(process.env.WS_MAX_MESSAGES_PER_WINDOW || 120);
 const WS_MESSAGE_WINDOW_MS = Number(process.env.WS_MESSAGE_WINDOW_MS || 10_000);
+const WS_HEARTBEAT_INTERVAL_MS = Math.max(Number(process.env.WS_HEARTBEAT_INTERVAL_MS || 25_000), 5_000);
+const WS_HEARTBEAT_TIMEOUT_MS = Math.max(Number(process.env.WS_HEARTBEAT_TIMEOUT_MS || 12_000), 2_000);
 const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || "128kb";
 const SHORT_INVITE_CODE_LENGTH = Math.min(Math.max(Number(process.env.SHORT_INVITE_CODE_LENGTH || 7), 4), 16);
 const SHORT_INVITE_MAX_ACTIVE = Math.min(Math.max(Number(process.env.SHORT_INVITE_MAX_ACTIVE || 50000), 100), 500000);
@@ -219,16 +221,36 @@ function send(ws, payload) {
   }
 }
 
-function summarizeTask(task) {
-  if (!task || typeof task !== "object") {
+function summarizeTask(job) {
+  if (!job || !job.task || typeof job.task !== "object") {
     return null;
   }
+  const task = job.task;
   if (task.op === "run_js") {
-    return {
+    const executionModel = job.executionModel || task.executionModel || "single";
+    const summary = {
       op: "run_js",
+      executionModel,
       timeoutMs: task.timeoutMs,
       codeBytes: Buffer.byteLength(String(task.code || ""), "utf8"),
       hasArgs: task.args !== undefined,
+    };
+    if (executionModel === "sharded") {
+      summary.shardConfig = job.shardConfig || task.shardConfig || null;
+      summary.reducer = job.reducer || task.reducer || null;
+      summary.shards = {
+        total: Number.isInteger(job.totalShards) ? job.totalShards : 0,
+        completed: Number.isInteger(job.completedShards) ? job.completedShards : 0,
+        failed: Number.isInteger(job.failedShards) ? job.failedShards : 0,
+      };
+    }
+    return summary;
+  }
+  if (task.op === "add") {
+    return {
+      op: "add",
+      a: task.a,
+      b: task.b,
     };
   }
   return task;
@@ -258,6 +280,14 @@ app.get(CLIENT_PATH, (_req, res) => {
 
 app.get(WORKER_PATH, (_req, res) => {
   res.sendFile(path.join(__dirname, "..", "web", "worker.html"));
+});
+
+app.get(withBasePath("/parallel-guide"), (_req, res) => {
+  res.sendFile(path.join(__dirname, "..", "web", "parallel-guide.html"));
+});
+
+app.get(withBasePath("/parallel-guide.html"), (_req, res) => {
+  res.sendFile(path.join(__dirname, "..", "web", "parallel-guide.html"));
 });
 
 app.get(withBasePath("/j/:code"), (req, res) => {
@@ -382,7 +412,8 @@ app.post(withBasePath("/api/jobs/run-js"), auth.requireClientAuth, (req, res) =>
     return res.status(400).json({ error: parsed.error });
   }
 
-  const job = store.createJob(parsed.value);
+  const job =
+    parsed.value.executionModel === "sharded" ? store.createShardedRunJsJob(parsed.value) : store.createJob(parsed.value);
   dispatcher.dispatch();
   return res.status(201).json({ jobId: job.jobId, status: job.status });
 });
@@ -396,7 +427,8 @@ app.get(withBasePath("/api/jobs/:jobId"), auth.requireClientAuth, (req, res) => 
   return res.json({
     jobId: job.jobId,
     status: job.status,
-    task: summarizeTask(job.task),
+    executionModel: job.executionModel || "single",
+    task: summarizeTask(job),
     result: job.result,
     error: job.error,
   });
@@ -454,6 +486,8 @@ wss.on("connection", (ws, req) => {
     invalidCount: 0,
     registeredWorkerId: null,
     messagesThisWindow: 0,
+    awaitingPongSince: 0,
+    lastPongAt: Date.now(),
   };
 
   const resetMessageBudgetTimer = setInterval(() => {
@@ -463,7 +497,37 @@ wss.on("connection", (ws, req) => {
     ws.meta.messagesThisWindow = 0;
   }, WS_MESSAGE_WINDOW_MS);
 
+  const heartbeatTimer = setInterval(() => {
+    if (!ws.meta || ws.readyState !== 1) {
+      return;
+    }
+    const now = Date.now();
+    if (ws.meta.awaitingPongSince > 0 && now - ws.meta.awaitingPongSince > WS_HEARTBEAT_TIMEOUT_MS) {
+      const workerId = ws.meta.registeredWorkerId || "unknown";
+      console.warn(`[worker_heartbeat_timeout] worker_id=${workerId} ip=${ip}`);
+      ws.terminate();
+      return;
+    }
+    ws.meta.awaitingPongSince = now;
+    try {
+      ws.ping();
+      send(ws, { type: "noop", heartbeat: true, ts: now });
+    } catch (error) {
+      console.warn(`[worker_heartbeat_ping_failed] ip=${ip} message=${error.message}`);
+    }
+  }, WS_HEARTBEAT_INTERVAL_MS);
+
+  ws.on("pong", () => {
+    if (!ws.meta) {
+      return;
+    }
+    ws.meta.awaitingPongSince = 0;
+    ws.meta.lastPongAt = Date.now();
+  });
+
   ws.on("message", (raw) => {
+    ws.meta.awaitingPongSince = 0;
+    ws.meta.lastPongAt = Date.now();
     ws.meta.messagesThisWindow += 1;
     if (ws.meta.messagesThisWindow > WS_MAX_MESSAGES_PER_WINDOW) {
       ws.close(1008, "Rate limit exceeded");
@@ -508,6 +572,11 @@ wss.on("connection", (ws, req) => {
 
     store.markWorkerSeen(parsed.workerId);
 
+    if (parsed.type === "heartbeat") {
+      send(ws, { type: "noop", heartbeatAck: true, ts: Date.now() });
+      return;
+    }
+
     if (parsed.type === "ready") {
       store.markWorkerReady(parsed.workerId);
       send(ws, { type: "noop" });
@@ -539,6 +608,7 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", () => {
     clearInterval(resetMessageBudgetTimer);
+    clearInterval(heartbeatTimer);
     decConnections(ip);
 
     const removed = store.removeWorkerSocket(ws);

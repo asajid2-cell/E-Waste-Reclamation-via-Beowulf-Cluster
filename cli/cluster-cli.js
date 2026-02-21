@@ -12,7 +12,9 @@ const DEFAULT_POLL_MS = 700;
 function printUsage() {
   console.log("Usage:");
   console.log("  node cli/cluster-cli.js submit --a <int> --b <int> [--host <url>] [--client-token <token>] [--timeout-ms <ms>]");
-  console.log("  node cli/cluster-cli.js run-js (--file <path> | --code <js>) [--args-json <json>] [--run-timeout-ms <ms>] [--timeout-ms <ms>] [--host <url>] [--client-token <token>]");
+  console.log(
+    "  node cli/cluster-cli.js run-js (--file <path> | --code <js>) [--args-json <json>] [--execution-model single|sharded] [--total-units <n>] [--units-per-shard <n>] [--reducer sum|collect|min|max] [--sum-fields <csv>] [--run-timeout-ms <ms>] [--timeout-ms <ms>] [--host <url>] [--client-token <token>]",
+  );
   console.log(
     "  node cli/cluster-cli.js invite [--host <url>] [--client-token <token>] [--ttl-sec <seconds>] [--label <name>] [--qr] [--qr-file <path>]",
   );
@@ -167,6 +169,9 @@ async function waitForJob({ host, token, jobId, timeoutMs }) {
 
     if (job.status !== lastStatus) {
       console.log(`Status: ${job.status}`);
+      if (job.executionModel) {
+        console.log(`Execution Model: ${job.executionModel}`);
+      }
       lastStatus = job.status;
     }
 
@@ -240,6 +245,13 @@ function parseJsonArgs(flags) {
   }
 }
 
+function parseCsvFields(raw) {
+  return String(raw || "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
 async function runJs(flags) {
   const host = normalizeHost(flags.host);
   const timeoutMs = flags["timeout-ms"] ? parsePositiveNumber(flags["timeout-ms"], "timeout-ms") : DEFAULT_TIMEOUT_MS;
@@ -247,14 +259,39 @@ async function runJs(flags) {
   const code = loadScriptCode(flags);
   const args = parseJsonArgs(flags);
   const runTimeoutMs = flags["run-timeout-ms"] ? parsePositiveNumber(flags["run-timeout-ms"], "run-timeout-ms") : undefined;
+  const executionModel = flags["execution-model"] ? String(flags["execution-model"]).trim().toLowerCase() : "single";
+  if (!["single", "sharded"].includes(executionModel)) {
+    throw new Error("--execution-model must be 'single' or 'sharded'");
+  }
 
   console.log(`Submitting custom JS job to ${host}`);
   const body = {
     code,
     args,
+    executionModel,
   };
   if (runTimeoutMs !== undefined) {
     body.timeoutMs = Math.trunc(runTimeoutMs);
+  }
+  if (executionModel === "sharded") {
+    const totalUnits = parseInteger(flags["total-units"], "total-units");
+    const unitsPerShard = parseInteger(flags["units-per-shard"], "units-per-shard");
+    body.shardConfig = { totalUnits, unitsPerShard };
+    const reducerType = flags.reducer ? String(flags.reducer).trim().toLowerCase() : "sum";
+    if (!["sum", "collect", "min", "max"].includes(reducerType)) {
+      throw new Error("--reducer must be one of: sum, collect, min, max");
+    }
+    if (reducerType === "sum") {
+      const fields = parseCsvFields(flags["sum-fields"] || "hits,samples");
+      if (fields.length === 0) {
+        throw new Error("--sum-fields must contain at least one field name");
+      }
+      body.reducer = { type: "sum", fields };
+    } else if (reducerType === "collect") {
+      body.reducer = { type: "collect" };
+    } else {
+      body.reducer = { type: reducerType, field: "value" };
+    }
   }
 
   const jobCreated = await requestJson({

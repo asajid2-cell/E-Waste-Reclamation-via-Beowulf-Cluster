@@ -3,9 +3,79 @@ const { randomUUID } = require("node:crypto");
 const MIN_VALUE = -1_000_000_000;
 const MAX_VALUE = 1_000_000_000;
 const DEFAULT_MAX_CUSTOM_RESULT_BYTES = 64 * 1024;
+const DEFAULT_MAX_SHARD_ATTEMPTS = 3;
 
 function isValidInputNumber(value) {
   return Number.isInteger(value) && value >= MIN_VALUE && value <= MAX_VALUE;
+}
+
+function buildShardInjectedCode(sourceCode, shardContext) {
+  const contextLiteral = JSON.stringify(shardContext);
+  return `globalThis.__BRAIN__ = Object.freeze(${contextLiteral});
+${sourceCode}`;
+}
+
+function initializeReducerAggregate(reducer) {
+  if (!reducer || typeof reducer !== "object") {
+    return {};
+  }
+  if (reducer.type === "collect") {
+    return [];
+  }
+  if (reducer.type === "sum") {
+    const aggregate = {};
+    for (const field of reducer.fields || []) {
+      aggregate[field] = 0;
+    }
+    return aggregate;
+  }
+  return { value: null };
+}
+
+function applyReducerResult(reducer, aggregate, shardResult) {
+  if (!reducer || typeof reducer !== "object") {
+    return;
+  }
+
+  if (reducer.type === "collect") {
+    if (Array.isArray(aggregate)) {
+      aggregate.push(shardResult);
+    }
+    return;
+  }
+
+  if (reducer.type === "sum") {
+    if (!shardResult || typeof shardResult !== "object" || Array.isArray(shardResult)) {
+      throw new Error("sum reducer expects shard result object.");
+    }
+    for (const field of reducer.fields || []) {
+      const value = Number(shardResult[field]);
+      if (!Number.isFinite(value)) {
+        throw new Error(`sum reducer field '${field}' must be numeric.`);
+      }
+      aggregate[field] = (aggregate[field] || 0) + value;
+    }
+    return;
+  }
+
+  if (reducer.type === "min" || reducer.type === "max") {
+    const field = reducer.field;
+    const numeric = Number(shardResult && typeof shardResult === "object" ? shardResult[field] : NaN);
+    if (!Number.isFinite(numeric)) {
+      throw new Error(`${reducer.type} reducer field '${field}' must be numeric.`);
+    }
+    if (aggregate.value === null) {
+      aggregate.value = numeric;
+      return;
+    }
+    if (reducer.type === "min" && numeric < aggregate.value) {
+      aggregate.value = numeric;
+      return;
+    }
+    if (reducer.type === "max" && numeric > aggregate.value) {
+      aggregate.value = numeric;
+    }
+  }
 }
 
 function createStore(options = {}) {
@@ -27,25 +97,103 @@ function createStore(options = {}) {
     job.updatedAt = nowIso();
   }
 
-  function createJob(task) {
-    const jobId = randomUUID();
+  function createJob(task, createOptions = {}) {
+    const jobId = createOptions.jobId || randomUUID();
     const job = {
       jobId,
       task,
-      status: "queued",
+      status: createOptions.status || "queued",
       result: null,
       error: null,
       assignedWorkerId: null,
+      hidden: Boolean(createOptions.hidden),
+      parentJobId: createOptions.parentJobId || null,
+      executionModel: createOptions.executionModel || "single",
+      attempt: 0,
+      maxAttempts:
+        Number.isInteger(createOptions.maxAttempts) && createOptions.maxAttempts > 0
+          ? createOptions.maxAttempts
+          : 1,
+      shardIndex: Number.isInteger(createOptions.shardIndex) ? createOptions.shardIndex : null,
+      totalShards: Number.isInteger(createOptions.totalShards) ? createOptions.totalShards : null,
+      sourceCode: createOptions.sourceCode || null,
+      shardContextBase: createOptions.shardContextBase || null,
+      shardConfig: createOptions.shardConfig || null,
+      reducer: createOptions.reducer || null,
+      aggregate: createOptions.aggregate || null,
+      completedShards: Number.isInteger(createOptions.completedShards) ? createOptions.completedShards : null,
+      failedShards: Number.isInteger(createOptions.failedShards) ? createOptions.failedShards : null,
+      childJobIds: Array.isArray(createOptions.childJobIds) ? createOptions.childJobIds : null,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
     jobs.set(jobId, job);
-    queue.push(jobId);
+    if (!createOptions.skipQueue && job.status === "queued") {
+      queue.push(jobId);
+    }
     return job;
   }
 
+  function createShardedRunJsJob(task) {
+    const shardConfig = task.shardConfig;
+    const reducer = task.reducer;
+    const totalShards = Math.ceil(shardConfig.totalUnits / shardConfig.unitsPerShard);
+    const parentJob = createJob(task, {
+      skipQueue: true,
+      status: "running",
+      executionModel: "sharded",
+      maxAttempts: 1,
+      totalShards,
+      shardConfig,
+      reducer,
+      aggregate: initializeReducerAggregate(reducer),
+      completedShards: 0,
+      failedShards: 0,
+      childJobIds: [],
+    });
+
+    let remainingUnits = shardConfig.totalUnits;
+    let offset = 0;
+    for (let shardIndex = 0; shardIndex < totalShards; shardIndex += 1) {
+      const units = Math.min(shardConfig.unitsPerShard, remainingUnits);
+      const childTask = {
+        op: "run_js",
+        code: "",
+        args: task.args,
+        timeoutMs: task.timeoutMs,
+      };
+      const childJob = createJob(childTask, {
+        hidden: true,
+        parentJobId: parentJob.jobId,
+        executionModel: "sharded",
+        maxAttempts: task.shardMaxAttempts || DEFAULT_MAX_SHARD_ATTEMPTS,
+        shardIndex,
+        totalShards,
+        sourceCode: task.code,
+        shardContextBase: {
+          parentJobId: parentJob.jobId,
+          shardId: shardIndex,
+          totalShards,
+          units,
+          totalUnits: shardConfig.totalUnits,
+          offset,
+        },
+      });
+      parentJob.childJobIds.push(childJob.jobId);
+      remainingUnits -= units;
+      offset += units;
+    }
+
+    touchJob(parentJob);
+    return parentJob;
+  }
+
   function getJob(jobId) {
-    return jobs.get(jobId) || null;
+    const job = jobs.get(jobId) || null;
+    if (!job || job.hidden) {
+      return null;
+    }
+    return job;
   }
 
   function getNextQueuedJob() {
@@ -153,13 +301,43 @@ function createStore(options = {}) {
     if (!worker || worker.state !== "idle") {
       return false;
     }
+    if (job.parentJobId && job.sourceCode && job.shardContextBase) {
+      const nextAttempt = job.attempt + 1;
+      const shardContext = {
+        ...job.shardContextBase,
+        attempt: nextAttempt,
+      };
+      job.task.code = buildShardInjectedCode(job.sourceCode, shardContext);
+    }
     job.status = "running";
     job.assignedWorkerId = workerId;
+    job.attempt += 1;
     touchJob(job);
     worker.state = "busy";
     worker.lastSeenAt = Date.now();
     assignments.set(job.jobId, workerId);
     return true;
+  }
+
+  function failParentAndStopChildren(parentJob, reason) {
+    parentJob.status = "failed";
+    parentJob.error = reason;
+    touchJob(parentJob);
+
+    if (!Array.isArray(parentJob.childJobIds)) {
+      return;
+    }
+    for (const childJobId of parentJob.childJobIds) {
+      const childJob = jobs.get(childJobId);
+      if (!childJob) {
+        continue;
+      }
+      if (childJob.status === "queued") {
+        childJob.status = "failed";
+        childJob.error = "parent_failed";
+        touchJob(childJob);
+      }
+    }
   }
 
   function finishJob(workerId, jobId, result) {
@@ -205,6 +383,35 @@ function createStore(options = {}) {
 
     worker.state = "idle";
     worker.lastSeenAt = Date.now();
+
+    if (job.parentJobId) {
+      const parentJob = jobs.get(job.parentJobId);
+      if (!parentJob) {
+        return { ok: true };
+      }
+      if (parentJob.status === "failed" || parentJob.status === "done") {
+        return { ok: true };
+      }
+      try {
+        applyReducerResult(parentJob.reducer, parentJob.aggregate, normalizedResult);
+      } catch (error) {
+        failParentAndStopChildren(parentJob, `reducer_error:${error.message}`);
+        return { ok: true };
+      }
+      parentJob.completedShards += 1;
+      if (parentJob.completedShards >= parentJob.totalShards) {
+        parentJob.status = "done";
+        parentJob.result = {
+          reducer: parentJob.reducer,
+          aggregate: parentJob.aggregate,
+          completedShards: parentJob.completedShards,
+          totalShards: parentJob.totalShards,
+        };
+        parentJob.error = null;
+      }
+      touchJob(parentJob);
+    }
+
     return { ok: true };
   }
 
@@ -220,13 +427,34 @@ function createStore(options = {}) {
     }
 
     assignments.delete(jobId);
+    worker.state = "idle";
+    worker.lastSeenAt = Date.now();
+
+    if (job.parentJobId && job.status === "running" && job.attempt < job.maxAttempts) {
+      job.status = "queued";
+      job.error = `retryable:${error}`;
+      job.assignedWorkerId = null;
+      touchJob(job);
+      requeueJob(jobId, true);
+      return { ok: true, requeued: true };
+    }
+
     job.status = "failed";
     job.error = error;
     job.assignedWorkerId = workerId;
     touchJob(job);
 
-    worker.state = "idle";
-    worker.lastSeenAt = Date.now();
+    if (job.parentJobId) {
+      const parentJob = jobs.get(job.parentJobId);
+      if (parentJob && parentJob.status !== "failed" && parentJob.status !== "done") {
+        parentJob.failedShards += 1;
+        failParentAndStopChildren(
+          parentJob,
+          `Shard ${job.shardIndex} failed after ${job.attempt}/${job.maxAttempts} attempts: ${error}`,
+        );
+      }
+    }
+
     return { ok: true };
   }
 
@@ -277,6 +505,7 @@ function createStore(options = {}) {
     MAX_VALUE,
     isValidInputNumber,
     createJob,
+    createShardedRunJsJob,
     getJob,
     dequeueQueuedJob,
     requeueJob,
