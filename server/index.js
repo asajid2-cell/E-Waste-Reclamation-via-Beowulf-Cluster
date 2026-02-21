@@ -643,7 +643,7 @@ wss.on("connection", (ws, req) => {
 
     if (parsed.type === "register") {
       ws.meta.registeredWorkerId = parsed.workerId;
-      store.registerWorker(parsed.workerId, ws);
+      store.registerWorker(parsed.workerId, ws, parsed.capabilities || null);
       send(ws, { type: "ack", message: "registered", workerId: parsed.workerId });
       return;
     }
@@ -661,6 +661,9 @@ wss.on("connection", (ws, req) => {
     store.markWorkerSeen(parsed.workerId);
 
     if (parsed.type === "heartbeat") {
+      if (parsed.capabilities) {
+        store.updateWorkerCapabilities(parsed.workerId, parsed.capabilities);
+      }
       send(ws, { type: "noop", heartbeatAck: true, ts: Date.now() });
       return;
     }

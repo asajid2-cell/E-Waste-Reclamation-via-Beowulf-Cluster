@@ -26,7 +26,7 @@ function createDispatcher(store, auth, log = console) {
         return;
       }
 
-      const worker = store.getFirstIdleWorker();
+      const worker = store.getFirstIdleWorker(nextJob);
       if (!worker) {
         store.requeueJob(nextJob.jobId, true);
         return;

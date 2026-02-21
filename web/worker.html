@@ -566,6 +566,10 @@ self.onmessage = async (event) => {
       let wakeLockSentinel = null;
       let metricsTimer = null;
       let metricsErrorShown = false;
+      let capabilitiesTimer = null;
+      let batteryManagerPromise = null;
+      let batterySnapshot = null;
+      let capabilitySnapshot = null;
 
       workerIdEl.textContent = workerId;
       inviteStateEl.textContent = inviteToken ? "present" : "missing";
@@ -677,6 +681,111 @@ self.onmessage = async (event) => {
         metricsTimer = setInterval(() => {
           fetchMetrics().catch(() => {});
         }, 3000);
+      }
+
+      function getConnectionInfo() {
+        return navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
+      }
+
+      function updateCapabilitySnapshot() {
+        const snapshot = {};
+
+        const cpu = Number(navigator.hardwareConcurrency);
+        if (Number.isFinite(cpu) && cpu > 0) {
+          snapshot.hardwareConcurrency = Math.round(cpu);
+        }
+
+        const memory = Number(navigator.deviceMemory);
+        if (Number.isFinite(memory) && memory > 0) {
+          snapshot.deviceMemoryGB = Number(memory);
+        }
+
+        if (typeof navigator.platform === "string" && navigator.platform.trim()) {
+          snapshot.platform = navigator.platform.trim().slice(0, 120);
+        }
+
+        if (typeof document.visibilityState === "string" && document.visibilityState) {
+          snapshot.visibility = document.visibilityState;
+        }
+
+        const connection = getConnectionInfo();
+        if (connection) {
+          const connOut = {};
+          if (typeof connection.effectiveType === "string" && connection.effectiveType) {
+            connOut.effectiveType = connection.effectiveType;
+          }
+          const downlink = Number(connection.downlink);
+          if (Number.isFinite(downlink) && downlink >= 0) {
+            connOut.downlinkMbps = Number(downlink.toFixed(2));
+          }
+          const rtt = Number(connection.rtt);
+          if (Number.isFinite(rtt) && rtt >= 0) {
+            connOut.rttMs = Math.round(rtt);
+          }
+          if (typeof connection.saveData === "boolean") {
+            connOut.saveData = connection.saveData;
+          }
+          if (Object.keys(connOut).length > 0) {
+            snapshot.connection = connOut;
+          }
+        }
+
+        if (batterySnapshot) {
+          snapshot.battery = { ...batterySnapshot };
+        }
+
+        capabilitySnapshot = Object.keys(snapshot).length > 0 ? snapshot : null;
+        return capabilitySnapshot;
+      }
+
+      function getCapabilitiesForWire() {
+        return updateCapabilitySnapshot();
+      }
+
+      function refreshBatterySnapshot(manager) {
+        if (!manager) {
+          return;
+        }
+        const level = Number(manager.level);
+        batterySnapshot = {
+          level: Number.isFinite(level) ? Math.max(0, Math.min(1, level)) : 1,
+          charging: Boolean(manager.charging),
+        };
+        updateCapabilitySnapshot();
+      }
+
+      async function ensureBatteryManager() {
+        if (typeof navigator.getBattery !== "function") {
+          return null;
+        }
+        if (!batteryManagerPromise) {
+          batteryManagerPromise = navigator.getBattery().catch(() => null);
+        }
+        return batteryManagerPromise;
+      }
+
+      async function initializeCapabilities() {
+        const connection = getConnectionInfo();
+        if (connection && typeof connection.addEventListener === "function") {
+          connection.addEventListener("change", () => {
+            updateCapabilitySnapshot();
+          });
+        }
+
+        const batteryManager = await ensureBatteryManager();
+        if (batteryManager && typeof batteryManager.addEventListener === "function") {
+          refreshBatterySnapshot(batteryManager);
+          batteryManager.addEventListener("levelchange", () => refreshBatterySnapshot(batteryManager));
+          batteryManager.addEventListener("chargingchange", () => refreshBatterySnapshot(batteryManager));
+        }
+
+        updateCapabilitySnapshot();
+        if (capabilitiesTimer) {
+          clearInterval(capabilitiesTimer);
+        }
+        capabilitiesTimer = setInterval(() => {
+          updateCapabilitySnapshot();
+        }, 15000);
       }
 
       function setConnectionState(state) {
@@ -791,7 +900,12 @@ self.onmessage = async (event) => {
       function startHeartbeat() {
         clearHeartbeat();
         heartbeatTimer = setInterval(() => {
-          send({ type: "heartbeat", workerId });
+          const message = { type: "heartbeat", workerId };
+          const capabilities = getCapabilitiesForWire();
+          if (capabilities) {
+            message.capabilities = capabilities;
+          }
+          send(message);
         }, HEARTBEAT_INTERVAL_MS);
       }
 
@@ -1109,7 +1223,12 @@ self.onmessage = async (event) => {
           reconnectDelay = 500;
           setConnectionState("connected");
           appendLog(`connected to ${url}`);
-          send({ type: "register", workerId });
+          const registerMessage = { type: "register", workerId };
+          const capabilities = getCapabilitiesForWire();
+          if (capabilities) {
+            registerMessage.capabilities = capabilities;
+          }
+          send(registerMessage);
           send({ type: "ready", workerId });
           startHeartbeat();
           fetchMetrics().catch(() => {});
@@ -1190,10 +1309,14 @@ self.onmessage = async (event) => {
 
       connect();
       startMetricsPolling();
+      initializeCapabilities().catch(() => {});
       initializeWakeLock();
       window.addEventListener("beforeunload", () => {
         if (metricsTimer) {
           clearInterval(metricsTimer);
+        }
+        if (capabilitiesTimer) {
+          clearInterval(capabilitiesTimer);
         }
       });
     </script>

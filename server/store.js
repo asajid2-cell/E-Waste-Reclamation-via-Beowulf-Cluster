@@ -131,6 +131,71 @@ function createStore(options = {}) {
   const socketToWorker = new Map();
   const assignments = new Map();
 
+  function clampNumber(value, minValue, maxValue, fallback) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) {
+      return fallback;
+    }
+    return Math.max(minValue, Math.min(maxValue, n));
+  }
+
+  function normalizeWorkerCapabilities(capabilities) {
+    if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
+      return null;
+    }
+    const connection =
+      capabilities.connection && typeof capabilities.connection === "object" && !Array.isArray(capabilities.connection)
+        ? capabilities.connection
+        : {};
+    const battery =
+      capabilities.battery && typeof capabilities.battery === "object" && !Array.isArray(capabilities.battery)
+        ? capabilities.battery
+        : {};
+    const normalized = {
+      hardwareConcurrency: Math.trunc(clampNumber(capabilities.hardwareConcurrency, 1, 128, 1)),
+      deviceMemoryGB: clampNumber(capabilities.deviceMemoryGB, 0.25, 256, 1),
+      effectiveType:
+        typeof connection.effectiveType === "string" && connection.effectiveType.length <= 16
+          ? connection.effectiveType
+          : "unknown",
+      downlinkMbps: clampNumber(connection.downlinkMbps, 0, 10000, 0),
+      rttMs: clampNumber(connection.rttMs, 0, 60000, 0),
+      saveData: Boolean(connection.saveData),
+      platform:
+        typeof capabilities.platform === "string" && capabilities.platform.length <= 120
+          ? capabilities.platform
+          : "",
+      visibility:
+        typeof capabilities.visibility === "string" && capabilities.visibility.length <= 24
+          ? capabilities.visibility
+          : "unknown",
+      batteryLevel: clampNumber(battery.level, 0, 1, 1),
+      charging: battery.charging === undefined ? null : Boolean(battery.charging),
+      updatedAt: nowIso(),
+    };
+    return normalized;
+  }
+
+  function computeStaticResourceScore(capabilities) {
+    if (!capabilities) {
+      return 1;
+    }
+    const cpuScore = clampNumber(capabilities.hardwareConcurrency, 1, 32, 1) / 4;
+    const memScore = clampNumber(capabilities.deviceMemoryGB, 0.25, 32, 1) / 4;
+    let networkFactor = 1;
+    if (capabilities.effectiveType === "slow-2g" || capabilities.effectiveType === "2g") {
+      networkFactor = 0.7;
+    } else if (capabilities.effectiveType === "3g") {
+      networkFactor = 0.85;
+    } else if (capabilities.effectiveType === "4g") {
+      networkFactor = 1.05;
+    }
+    const saveDataFactor = capabilities.saveData ? 0.9 : 1;
+    const batteryFactor = capabilities.charging === false && capabilities.batteryLevel < 0.2 ? 0.8 : 1;
+    const base = (cpuScore * 0.65 + memScore * 0.35) * networkFactor * saveDataFactor * batteryFactor;
+    return clampNumber(base, 0.35, 6, 1);
+  }
+
   function nowIso() {
     return new Date().toISOString();
   }
@@ -161,6 +226,12 @@ function createStore(options = {}) {
       contributedUnits: 0,
       totalDurationMs: 0,
       lastJobAt: 0,
+      throughputUnitsPerSecEma: 0,
+      throughputSamples: 0,
+      parentThroughput: {},
+      capabilities: null,
+      resourceScore: 1,
+      dispatchScore: 1,
     };
     workerStats.set(workerId, created);
     return created;
@@ -176,6 +247,22 @@ function createStore(options = {}) {
     stats.lastConnectedAt = nowMs;
     stats.lastSeenAt = nowMs;
     return stats;
+  }
+
+  function updateWorkerCapabilities(workerId, capabilities) {
+    const normalized = normalizeWorkerCapabilities(capabilities);
+    if (!normalized) {
+      return null;
+    }
+    const worker = workers.get(workerId);
+    if (worker) {
+      worker.capabilities = normalized;
+      worker.staticResourceScore = computeStaticResourceScore(normalized);
+    }
+    const stats = ensureWorkerStats(workerId);
+    stats.capabilities = normalized;
+    stats.resourceScore = computeStaticResourceScore(normalized);
+    return normalized;
   }
 
   function markWorkerDisconnected(workerId) {
@@ -219,6 +306,40 @@ function createStore(options = {}) {
       stats.totalDurationMs += durationMs;
     } else if (Number.isFinite(job && job.assignedAtMs ? job.assignedAtMs : Number.NaN)) {
       stats.totalDurationMs += Math.max(0, nowMs - job.assignedAtMs);
+    }
+
+    if (job && job.parentJobId) {
+      const units = Number(job.shardContextBase && job.shardContextBase.units);
+      const measuredDurationMs = Number.isFinite(durationMs) && durationMs > 0 ? durationMs : Number(nowMs - (job.assignedAtMs || nowMs));
+      if (Number.isFinite(units) && units > 0 && Number.isFinite(measuredDurationMs) && measuredDurationMs > 0) {
+        const throughput = units / (measuredDurationMs / 1000);
+        if (stats.throughputUnitsPerSecEma > 0) {
+          stats.throughputUnitsPerSecEma = stats.throughputUnitsPerSecEma * 0.7 + throughput * 0.3;
+        } else {
+          stats.throughputUnitsPerSecEma = throughput;
+        }
+        stats.throughputSamples += 1;
+
+        const parentPerf = stats.parentThroughput || {};
+        const previous = parentPerf[job.parentJobId];
+        if (previous && Number.isFinite(previous.ema) && previous.ema > 0) {
+          previous.ema = previous.ema * 0.65 + throughput * 0.35;
+          previous.updatedAt = nowMs;
+        } else {
+          parentPerf[job.parentJobId] = { ema: throughput, updatedAt: nowMs };
+        }
+
+        const parentEntries = Object.entries(parentPerf);
+        if (parentEntries.length > 24) {
+          parentEntries
+            .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
+            .slice(24)
+            .forEach(([key]) => {
+              delete parentPerf[key];
+            });
+        }
+        stats.parentThroughput = parentPerf;
+      }
     }
   }
 
@@ -375,7 +496,7 @@ function createStore(options = {}) {
     }
   }
 
-  function registerWorker(workerId, ws) {
+  function registerWorker(workerId, ws, capabilities = null) {
     const existing = workers.get(workerId);
     if (existing && existing.ws && existing.ws !== ws) {
       socketToWorker.delete(existing.ws);
@@ -386,13 +507,24 @@ function createStore(options = {}) {
       }
     }
 
+    const normalizedCapabilities = normalizeWorkerCapabilities(capabilities);
+    const staticResourceScore = computeStaticResourceScore(normalizedCapabilities);
+
     workers.set(workerId, {
       workerId,
       ws,
       state: "idle",
       lastSeenAt: Date.now(),
+      lastAssignedAt: 0,
+      capabilities: normalizedCapabilities,
+      staticResourceScore,
+      dispatchScore: staticResourceScore,
     });
-    markWorkerConnected(workerId);
+    const stats = markWorkerConnected(workerId);
+    if (normalizedCapabilities) {
+      stats.capabilities = normalizedCapabilities;
+    }
+    stats.resourceScore = staticResourceScore;
     socketToWorker.set(ws, workerId);
   }
 
@@ -404,13 +536,67 @@ function createStore(options = {}) {
     return workers.get(workerId) || null;
   }
 
-  function getFirstIdleWorker() {
-    for (const worker of workers.values()) {
-      if (worker.state === "idle") {
-        return worker;
+  function getWorkerThroughputForJob(stats, job) {
+    if (!stats) {
+      return 0;
+    }
+    if (job && job.parentJobId && stats.parentThroughput && stats.parentThroughput[job.parentJobId]) {
+      const perParent = Number(stats.parentThroughput[job.parentJobId].ema);
+      if (Number.isFinite(perParent) && perParent > 0) {
+        return perParent;
       }
     }
-    return null;
+    const generic = Number(stats.throughputUnitsPerSecEma);
+    if (Number.isFinite(generic) && generic > 0) {
+      return generic;
+    }
+    return 0;
+  }
+
+  function getFirstIdleWorker(job = null) {
+    const idleWorkers = [];
+    for (const worker of workers.values()) {
+      if (worker.state === "idle") {
+        idleWorkers.push(worker);
+      }
+    }
+    if (idleWorkers.length === 0) {
+      return null;
+    }
+
+    const nowMs = Date.now();
+    const throughputs = idleWorkers
+      .map((worker) => getWorkerThroughputForJob(ensureWorkerStats(worker.workerId), job))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .sort((a, b) => a - b);
+    const medianThroughput =
+      throughputs.length > 0 ? throughputs[Math.floor(throughputs.length / 2)] : 0;
+
+    let bestWorker = null;
+    let bestScore = -1;
+    for (const worker of idleWorkers) {
+      const stats = ensureWorkerStats(worker.workerId);
+      const staticScore = Number(worker.staticResourceScore || stats.resourceScore || 1);
+      const throughput = getWorkerThroughputForJob(stats, job);
+      const perfFactor =
+        medianThroughput > 0 && throughput > 0
+          ? clampNumber(throughput / medianThroughput, 0.45, 3.2, 1)
+          : 1;
+      const failureRate = (stats.failedShards || 0) / ((stats.completedShards || 0) + 5);
+      const reconnectRate = (stats.reconnects || 0) / ((stats.completedJobs || 0) + 10);
+      const reliabilityFactor = 1 / (1 + failureRate * 2 + reconnectRate);
+      const idleMs = Math.max(0, nowMs - (worker.lastAssignedAt || 0));
+      const idleBoost = 1 + Math.min(idleMs / 20000, 0.35);
+      const dispatchScore = staticScore * perfFactor * reliabilityFactor * idleBoost;
+
+      worker.dispatchScore = dispatchScore;
+      stats.dispatchScore = dispatchScore;
+      if (dispatchScore > bestScore) {
+        bestScore = dispatchScore;
+        bestWorker = worker;
+      }
+    }
+    return bestWorker;
   }
 
   function markWorkerReady(workerId) {
@@ -454,6 +640,7 @@ function createStore(options = {}) {
     touchJob(job);
     worker.state = "busy";
     worker.lastSeenAt = Date.now();
+    worker.lastAssignedAt = Date.now();
     assignments.set(job.jobId, workerId);
     return true;
   }
@@ -659,6 +846,10 @@ function createStore(options = {}) {
       workerId: worker.workerId,
       state: worker.state,
       lastSeenMs: Math.max(0, now - worker.lastSeenAt),
+      dispatchScore: Number(worker.dispatchScore || 1),
+      hardwareConcurrency: worker.capabilities ? worker.capabilities.hardwareConcurrency : null,
+      deviceMemoryGB: worker.capabilities ? worker.capabilities.deviceMemoryGB : null,
+      effectiveType: worker.capabilities ? worker.capabilities.effectiveType : null,
     }));
   }
 
@@ -679,6 +870,13 @@ function createStore(options = {}) {
         connected,
         state: connectedWorker ? connectedWorker.state : "offline",
         lastSeenMs: Math.max(0, nowMs - stats.lastSeenAt),
+        dispatchScore: Number(
+          connectedWorker && Number.isFinite(connectedWorker.dispatchScore)
+            ? connectedWorker.dispatchScore
+            : stats.dispatchScore || 1,
+        ),
+        resourceScore: Number(stats.resourceScore || 1),
+        throughputUnitsPerSec: Number(stats.throughputUnitsPerSecEma || 0),
         reconnects: stats.reconnects,
         completedJobs,
         completedAddJobs: stats.completedAddJobs,
@@ -689,6 +887,7 @@ function createStore(options = {}) {
         contributedUnits: stats.contributedUnits,
         totalDurationMs: stats.totalDurationMs,
         avgDurationMs,
+        capabilities: stats.capabilities || null,
         firstSeenAt: stats.firstSeenAt ? new Date(stats.firstSeenAt).toISOString() : null,
         lastJobAt: stats.lastJobAt ? new Date(stats.lastJobAt).toISOString() : null,
       });
@@ -748,6 +947,7 @@ function createStore(options = {}) {
     dequeueQueuedJob,
     requeueJob,
     registerWorker,
+    updateWorkerCapabilities,
     workerExists,
     getWorker,
     getFirstIdleWorker,

@@ -162,23 +162,120 @@ function isValidWorkerId(workerId) {
   );
 }
 
+function sanitizeWorkerCapabilities(value) {
+  if (value === undefined) {
+    return { ok: true, value: null };
+  }
+  if (!isPlainObject(value)) {
+    return { ok: false, error: "capabilities must be an object." };
+  }
+
+  const connectionRaw = isPlainObject(value.connection) ? value.connection : {};
+  const batteryRaw = isPlainObject(value.battery) ? value.battery : {};
+  const output = {};
+
+  if (value.hardwareConcurrency !== undefined) {
+    const hc = Number(value.hardwareConcurrency);
+    if (!Number.isFinite(hc) || hc <= 0) {
+      return { ok: false, error: "capabilities.hardwareConcurrency must be a positive number." };
+    }
+    output.hardwareConcurrency = hc;
+  }
+  if (value.deviceMemoryGB !== undefined) {
+    const mem = Number(value.deviceMemoryGB);
+    if (!Number.isFinite(mem) || mem <= 0) {
+      return { ok: false, error: "capabilities.deviceMemoryGB must be a positive number." };
+    }
+    output.deviceMemoryGB = mem;
+  }
+  if (value.platform !== undefined) {
+    if (!isSafeString(String(value.platform), 120)) {
+      return { ok: false, error: "capabilities.platform must be a non-empty string up to 120 chars." };
+    }
+    output.platform = String(value.platform);
+  }
+  if (value.visibility !== undefined) {
+    if (!isSafeString(String(value.visibility), 24)) {
+      return { ok: false, error: "capabilities.visibility must be a non-empty string up to 24 chars." };
+    }
+    output.visibility = String(value.visibility);
+  }
+
+  const connection = {};
+  if (connectionRaw.effectiveType !== undefined) {
+    if (!isSafeString(String(connectionRaw.effectiveType), 16)) {
+      return { ok: false, error: "capabilities.connection.effectiveType must be a short string." };
+    }
+    connection.effectiveType = String(connectionRaw.effectiveType);
+  }
+  if (connectionRaw.downlinkMbps !== undefined) {
+    const downlink = Number(connectionRaw.downlinkMbps);
+    if (!Number.isFinite(downlink) || downlink < 0) {
+      return { ok: false, error: "capabilities.connection.downlinkMbps must be >= 0." };
+    }
+    connection.downlinkMbps = downlink;
+  }
+  if (connectionRaw.rttMs !== undefined) {
+    const rtt = Number(connectionRaw.rttMs);
+    if (!Number.isFinite(rtt) || rtt < 0) {
+      return { ok: false, error: "capabilities.connection.rttMs must be >= 0." };
+    }
+    connection.rttMs = rtt;
+  }
+  if (connectionRaw.saveData !== undefined) {
+    connection.saveData = Boolean(connectionRaw.saveData);
+  }
+  if (Object.keys(connection).length > 0) {
+    output.connection = connection;
+  }
+
+  const battery = {};
+  if (batteryRaw.level !== undefined) {
+    const level = Number(batteryRaw.level);
+    if (!Number.isFinite(level) || level < 0 || level > 1) {
+      return { ok: false, error: "capabilities.battery.level must be in [0,1]." };
+    }
+    battery.level = level;
+  }
+  if (batteryRaw.charging !== undefined) {
+    battery.charging = Boolean(batteryRaw.charging);
+  }
+  if (Object.keys(battery).length > 0) {
+    output.battery = battery;
+  }
+
+  return { ok: true, value: Object.keys(output).length > 0 ? output : null };
+}
+
 function parseWorkerMessage(message) {
   if (!isPlainObject(message) || !isSafeString(message.type, 32)) {
     return { ok: false, error: "Malformed message." };
   }
 
-  const { type, workerId, jobId, result, error } = message;
+  const { type, workerId, jobId, result, error, capabilities } = message;
   switch (type) {
     case "register":
       if (!isValidWorkerId(workerId)) {
         return { ok: false, error: "Invalid workerId." };
       }
-      return { ok: true, type, workerId };
+      {
+        const parsedCapabilities = sanitizeWorkerCapabilities(capabilities);
+        if (!parsedCapabilities.ok) {
+          return { ok: false, error: parsedCapabilities.error };
+        }
+        return { ok: true, type, workerId, capabilities: parsedCapabilities.value };
+      }
     case "heartbeat":
       if (!isValidWorkerId(workerId)) {
         return { ok: false, error: "Invalid workerId." };
       }
-      return { ok: true, type, workerId };
+      {
+        const parsedCapabilities = sanitizeWorkerCapabilities(capabilities);
+        if (!parsedCapabilities.ok) {
+          return { ok: false, error: parsedCapabilities.error };
+        }
+        return { ok: true, type, workerId, capabilities: parsedCapabilities.value };
+      }
     case "ready":
       if (!isValidWorkerId(workerId)) {
         return { ok: false, error: "Invalid workerId." };
