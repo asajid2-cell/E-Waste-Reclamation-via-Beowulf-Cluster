@@ -35,7 +35,7 @@ const SHORT_INVITE_MAX_ACTIVE = Math.min(Math.max(parsePositiveInt(process.env.S
 const SHORT_INVITE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 const WORKER_INVITE_PHRASE_WORDS = Math.min(Math.max(parsePositiveInt(process.env.WORKER_INVITE_PHRASE_WORDS, 8), 3), 8);
 const WORKER_INVITE_PHRASE_ALPHABET_SIZE = 2048;
-const SHARD_MIN_UNITS = Math.max(parsePositiveInt(process.env.SHARD_MIN_UNITS, 100000), 1);
+const SHARD_MIN_UNITS = Math.max(parsePositiveInt(process.env.SHARD_MIN_UNITS, 1), 1);
 const SHARD_MAX_PER_WORKER = Math.max(parsePositiveInt(process.env.SHARD_MAX_PER_WORKER, 200), 1);
 const SHARD_ABSOLUTE_MAX = Math.max(parsePositiveInt(process.env.SHARD_ABSOLUTE_MAX, 50000), 100);
 

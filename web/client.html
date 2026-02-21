@@ -406,7 +406,7 @@ return { hits, samples: units };</textarea>
                   <span class="tip-popup">Work size for each shard job. Lower = more shards and better load balancing; too low adds overhead.</span>
                 </span>
               </label>
-              <input id="shardUnitsPerShard" type="number" min="1" step="1" value="100000" placeholder="e.g. 100000" />
+              <input id="shardUnitsPerShard" type="number" min="1" step="1" value="20000" placeholder="e.g. 20000" />
             </div>
             <div class="setting-cell">
               <label class="setting-label" for="shardReducer">
@@ -451,7 +451,7 @@ return { hits, samples: units };</textarea>
             </div>
           </div>
           <div class="script-options-row">
-            <div class="script-inline-note">For Pi: <span class="mono">&nbsp;total=2000000, shard=100000, reducer=sum, fields=hits,samples</span>.</div>
+            <div class="script-inline-note">For Pi: <span class="mono">&nbsp;total=2000000, shard=20000, reducer=sum, fields=hits,samples</span>.</div>
             <div></div>
             <div></div>
           </div>
@@ -548,7 +548,7 @@ return hits;</pre>
       const resultEl = document.getElementById("result");
       const errorEl = document.getElementById("error");
 
-      const SHARD_MIN_UNITS = 100000;
+      const SHARD_MIN_UNITS = 1;
       const SHARD_MAX_PER_WORKER = 200;
       const SHARD_ABSOLUTE_MAX = 50000;
 
