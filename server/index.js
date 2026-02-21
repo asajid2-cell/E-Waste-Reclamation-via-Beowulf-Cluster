@@ -23,7 +23,7 @@ const BASE_PATH_RAW = process.env.BASE_PATH || "";
 const MAX_INVALID_MESSAGES = 4;
 const WS_MAX_PAYLOAD = parsePositiveInt(process.env.WS_MAX_PAYLOAD, 256 * 1024);
 const WS_MAX_CONNECTIONS_PER_IP = parsePositiveInt(process.env.WS_MAX_CONNECTIONS_PER_IP, 20);
-const WS_MAX_MESSAGES_PER_WINDOW = parsePositiveInt(process.env.WS_MAX_MESSAGES_PER_WINDOW, 1000);
+const WS_MAX_MESSAGES_PER_WINDOW = parsePositiveInt(process.env.WS_MAX_MESSAGES_PER_WINDOW, Number.MAX_SAFE_INTEGER);
 const WS_MESSAGE_WINDOW_MS = parsePositiveInt(process.env.WS_MESSAGE_WINDOW_MS, 10_000);
 const WS_HEARTBEAT_INTERVAL_MS = Math.max(parsePositiveInt(process.env.WS_HEARTBEAT_INTERVAL_MS, 25_000), 5_000);
 const WS_HEARTBEAT_TIMEOUT_MS = Math.max(parsePositiveInt(process.env.WS_HEARTBEAT_TIMEOUT_MS, 12_000), 2_000);
@@ -37,7 +37,8 @@ const WORKER_INVITE_PHRASE_WORDS = Math.min(Math.max(parsePositiveInt(process.en
 const WORKER_INVITE_PHRASE_ALPHABET_SIZE = 2048;
 const SHARD_MIN_UNITS = Math.max(parsePositiveInt(process.env.SHARD_MIN_UNITS, 1), 1);
 const SHARD_MAX_PER_WORKER = Math.max(parsePositiveInt(process.env.SHARD_MAX_PER_WORKER, 200), 1);
-const SHARD_ABSOLUTE_MAX = Math.max(parsePositiveInt(process.env.SHARD_ABSOLUTE_MAX, 50000), 100);
+const SHARD_ABSOLUTE_MAX = Math.max(parsePositiveInt(process.env.SHARD_ABSOLUTE_MAX, Number.MAX_SAFE_INTEGER), 100);
+const WORKER_MAX_CONCURRENT_JOBS = Math.max(parsePositiveInt(process.env.WORKER_MAX_CONCURRENT_JOBS, 8), 1);
 
 function normalizeBasePath(input) {
   if (!input || input === "/") {
@@ -89,6 +90,7 @@ const auth = createAuth(config);
 const app = express();
 const store = createStore({
   maxCustomResultBytes: config.customJobMaxResultBytes,
+  maxWorkerSlots: WORKER_MAX_CONCURRENT_JOBS,
 });
 const dispatcher = createDispatcher(store, auth, console);
 const shortInvites = new Map();
@@ -642,7 +644,7 @@ wss.on("connection", (ws, req) => {
 
     if (parsed.type === "register") {
       ws.meta.registeredWorkerId = parsed.workerId;
-      store.registerWorker(parsed.workerId, ws, parsed.capabilities || null);
+      store.registerWorker(parsed.workerId, ws, parsed.capabilities || null, parsed.features || null);
       send(ws, { type: "ack", message: "registered", workerId: parsed.workerId });
       return;
     }
@@ -680,7 +682,6 @@ wss.on("connection", (ws, req) => {
         send(ws, { type: "error", message: `Result rejected: ${done.reason}` });
         return;
       }
-      send(ws, { type: "ack", jobId: parsed.jobId });
       dispatcher.dispatch();
       return;
     }
@@ -691,7 +692,6 @@ wss.on("connection", (ws, req) => {
         send(ws, { type: "error", message: `Error rejected: ${failed.reason}` });
         return;
       }
-      send(ws, { type: "ack", jobId: parsed.jobId });
       dispatcher.dispatch();
     }
   });

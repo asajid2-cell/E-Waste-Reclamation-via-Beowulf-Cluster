@@ -550,7 +550,7 @@ return hits;</pre>
 
       const SHARD_MIN_UNITS = 1;
       const SHARD_MAX_PER_WORKER = 200;
-      const SHARD_ABSOLUTE_MAX = 50000;
+      const SHARD_ABSOLUTE_MAX = Number.MAX_SAFE_INTEGER;
 
       let currentJobId = null;
       let pollTimer = null;

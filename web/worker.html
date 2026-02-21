@@ -570,6 +570,7 @@ self.onmessage = async (event) => {
       let batteryManagerPromise = null;
       let batterySnapshot = null;
       let capabilitySnapshot = null;
+      let activeJobCount = 0;
 
       workerIdEl.textContent = workerId;
       inviteStateEl.textContent = inviteToken ? "present" : "missing";
@@ -1167,6 +1168,8 @@ self.onmessage = async (event) => {
           send({ type: "error", workerId, jobId: jobId || "unknown", error: "Malformed assignment payload" });
           return;
         }
+        activeJobCount += 1;
+        currentJobEl.textContent = activeJobCount > 1 ? `${activeJobCount} running` : jobId;
 
         try {
           if (payload.op === "add") {
@@ -1181,7 +1184,8 @@ self.onmessage = async (event) => {
           appendLog(`job ${jobId} failed: ${messageText}`);
           send({ type: "error", workerId, jobId, error: messageText });
         } finally {
-          currentJobEl.textContent = "idle";
+          activeJobCount = Math.max(0, activeJobCount - 1);
+          currentJobEl.textContent = activeJobCount > 0 ? `${activeJobCount} running` : "idle";
         }
       }
 
@@ -1228,6 +1232,7 @@ self.onmessage = async (event) => {
           if (capabilities) {
             registerMessage.capabilities = capabilities;
           }
+          registerMessage.features = { assignBatch: true };
           send(registerMessage);
           send({ type: "ready", workerId });
           startHeartbeat();
@@ -1254,6 +1259,20 @@ self.onmessage = async (event) => {
             handleAssignMessage(message).catch((error) => {
               appendLog(`assignment handler error: ${error.message}`);
             });
+            return;
+          }
+
+          if (message.type === "assign_batch") {
+            const batch = Array.isArray(message.assignments) ? message.assignments : [];
+            if (batch.length === 0) {
+              appendLog("received empty assignment batch");
+              return;
+            }
+            for (const item of batch) {
+              handleAssignMessage(item).catch((error) => {
+                appendLog(`assignment handler error: ${error.message}`);
+              });
+            }
             return;
           }
 

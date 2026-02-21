@@ -4,6 +4,7 @@ const MIN_VALUE = -1_000_000_000;
 const MAX_VALUE = 1_000_000_000;
 const DEFAULT_MAX_CUSTOM_RESULT_BYTES = 64 * 1024;
 const DEFAULT_MAX_SHARD_ATTEMPTS = 3;
+const DEFAULT_MAX_WORKER_SLOTS = 8;
 
 function isValidInputNumber(value) {
   return Number.isInteger(value) && value >= MIN_VALUE && value <= MAX_VALUE;
@@ -123,6 +124,9 @@ function createStore(options = {}) {
   const maxCustomResultBytes = Number.isInteger(options.maxCustomResultBytes) && options.maxCustomResultBytes > 0
     ? options.maxCustomResultBytes
     : DEFAULT_MAX_CUSTOM_RESULT_BYTES;
+  const maxWorkerSlots = Number.isInteger(options.maxWorkerSlots) && options.maxWorkerSlots > 0
+    ? options.maxWorkerSlots
+    : DEFAULT_MAX_WORKER_SLOTS;
 
   const jobs = new Map();
   const queue = [];
@@ -196,6 +200,40 @@ function createStore(options = {}) {
     return clampNumber(base, 0.35, 6, 1);
   }
 
+  function deriveWorkerSlotCapacity(capabilities) {
+    if (!capabilities) {
+      return 1;
+    }
+    const hc = Math.trunc(clampNumber(capabilities.hardwareConcurrency, 1, 128, 1));
+    const memoryGb = clampNumber(capabilities.deviceMemoryGB, 0.25, 256, 1);
+    const cpuBound = Math.max(1, hc > 2 ? hc - 1 : 1);
+    const memBound = Math.max(1, Math.floor(memoryGb));
+    let slots = Math.max(1, Math.min(cpuBound, memBound, maxWorkerSlots));
+    if (capabilities.charging === false && capabilities.batteryLevel < 0.15) {
+      slots = 1;
+    }
+    if (capabilities.saveData) {
+      slots = Math.max(1, Math.min(slots, 2));
+    }
+    return slots;
+  }
+
+  function getWorkerAvailableSlots(worker) {
+    if (!worker) {
+      return 0;
+    }
+    const maxSlots = Number.isInteger(worker.maxSlots) && worker.maxSlots > 0 ? worker.maxSlots : 1;
+    const inFlight = Number.isInteger(worker.inFlightCount) && worker.inFlightCount >= 0 ? worker.inFlightCount : 0;
+    return Math.max(0, maxSlots - inFlight);
+  }
+
+  function refreshWorkerState(worker) {
+    if (!worker) {
+      return;
+    }
+    worker.state = getWorkerAvailableSlots(worker) > 0 ? "idle" : "busy";
+  }
+
   function nowIso() {
     return new Date().toISOString();
   }
@@ -258,6 +296,8 @@ function createStore(options = {}) {
     if (worker) {
       worker.capabilities = normalized;
       worker.staticResourceScore = computeStaticResourceScore(normalized);
+      worker.maxSlots = deriveWorkerSlotCapacity(normalized);
+      refreshWorkerState(worker);
     }
     const stats = ensureWorkerStats(workerId);
     stats.capabilities = normalized;
@@ -496,7 +536,7 @@ function createStore(options = {}) {
     }
   }
 
-  function registerWorker(workerId, ws, capabilities = null) {
+  function registerWorker(workerId, ws, capabilities = null, features = null) {
     const existing = workers.get(workerId);
     if (existing && existing.ws && existing.ws !== ws) {
       socketToWorker.delete(existing.ws);
@@ -509,6 +549,7 @@ function createStore(options = {}) {
 
     const normalizedCapabilities = normalizeWorkerCapabilities(capabilities);
     const staticResourceScore = computeStaticResourceScore(normalizedCapabilities);
+    const maxSlots = deriveWorkerSlotCapacity(normalizedCapabilities);
 
     workers.set(workerId, {
       workerId,
@@ -516,10 +557,14 @@ function createStore(options = {}) {
       state: "idle",
       lastSeenAt: Date.now(),
       lastAssignedAt: 0,
+      inFlightCount: 0,
+      maxSlots,
+      supportsAssignBatch: Boolean(features && features.assignBatch),
       capabilities: normalizedCapabilities,
       staticResourceScore,
       dispatchScore: staticResourceScore,
     });
+    refreshWorkerState(workers.get(workerId));
     const stats = markWorkerConnected(workerId);
     if (normalizedCapabilities) {
       stats.capabilities = normalizedCapabilities;
@@ -556,7 +601,7 @@ function createStore(options = {}) {
   function getFirstIdleWorker(job = null) {
     const idleWorkers = [];
     for (const worker of workers.values()) {
-      if (worker.state === "idle") {
+      if (getWorkerAvailableSlots(worker) > 0) {
         idleWorkers.push(worker);
       }
     }
@@ -587,7 +632,8 @@ function createStore(options = {}) {
       const reliabilityFactor = 1 / (1 + failureRate * 2 + reconnectRate);
       const idleMs = Math.max(0, nowMs - (worker.lastAssignedAt || 0));
       const idleBoost = 1 + Math.min(idleMs / 20000, 0.35);
-      const dispatchScore = staticScore * perfFactor * reliabilityFactor * idleBoost;
+      const capacityBoost = 1 + Math.min(Math.max(getWorkerAvailableSlots(worker) - 1, 0) * 0.12, 0.9);
+      const dispatchScore = staticScore * perfFactor * reliabilityFactor * idleBoost * capacityBoost;
 
       worker.dispatchScore = dispatchScore;
       stats.dispatchScore = dispatchScore;
@@ -604,8 +650,8 @@ function createStore(options = {}) {
     if (!worker) {
       return false;
     }
-    worker.state = "idle";
     worker.lastSeenAt = Date.now();
+    refreshWorkerState(worker);
     recordWorkerSeen(workerId);
     return true;
   }
@@ -622,7 +668,7 @@ function createStore(options = {}) {
 
   function assignJob(job, workerId) {
     const worker = workers.get(workerId);
-    if (!worker || worker.state !== "idle") {
+    if (!worker || getWorkerAvailableSlots(worker) <= 0) {
       return false;
     }
     if (job.parentJobId && job.sourceCode && job.shardContextBase) {
@@ -638,9 +684,10 @@ function createStore(options = {}) {
     job.assignedAtMs = Date.now();
     job.attempt += 1;
     touchJob(job);
-    worker.state = "busy";
+    worker.inFlightCount += 1;
     worker.lastSeenAt = Date.now();
     worker.lastAssignedAt = Date.now();
+    refreshWorkerState(worker);
     assignments.set(job.jobId, workerId);
     return true;
   }
@@ -708,8 +755,9 @@ function createStore(options = {}) {
     job.assignedAtMs = null;
     touchJob(job);
 
-    worker.state = "idle";
+    worker.inFlightCount = Math.max(0, (worker.inFlightCount || 0) - 1);
     worker.lastSeenAt = Date.now();
+    refreshWorkerState(worker);
     recordWorkerCompletion(workerId, job, normalizedResult);
 
     if (job.parentJobId) {
@@ -772,8 +820,9 @@ function createStore(options = {}) {
     }
 
     assignments.delete(jobId);
-    worker.state = "idle";
+    worker.inFlightCount = Math.max(0, (worker.inFlightCount || 0) - 1);
     worker.lastSeenAt = Date.now();
+    refreshWorkerState(worker);
 
     if (job.parentJobId && job.status === "running" && job.attempt < job.maxAttempts) {
       job.status = "queued";
@@ -832,7 +881,6 @@ function createStore(options = {}) {
         requeueJob(jobId, true);
         requeuedJobId = jobId;
       }
-      break;
     }
 
     workers.delete(workerId);
@@ -846,6 +894,10 @@ function createStore(options = {}) {
       workerId: worker.workerId,
       state: worker.state,
       lastSeenMs: Math.max(0, now - worker.lastSeenAt),
+      inFlightCount: Number(worker.inFlightCount || 0),
+      maxSlots: Number(worker.maxSlots || 1),
+      availableSlots: getWorkerAvailableSlots(worker),
+      supportsAssignBatch: Boolean(worker.supportsAssignBatch),
       dispatchScore: Number(worker.dispatchScore || 1),
       hardwareConcurrency: worker.capabilities ? worker.capabilities.hardwareConcurrency : null,
       deviceMemoryGB: worker.capabilities ? worker.capabilities.deviceMemoryGB : null,
@@ -870,6 +922,10 @@ function createStore(options = {}) {
         connected,
         state: connectedWorker ? connectedWorker.state : "offline",
         lastSeenMs: Math.max(0, nowMs - stats.lastSeenAt),
+        inFlightCount: Number(connectedWorker ? connectedWorker.inFlightCount || 0 : 0),
+        maxSlots: Number(connectedWorker ? connectedWorker.maxSlots || 1 : 1),
+        availableSlots: Number(connectedWorker ? getWorkerAvailableSlots(connectedWorker) : 0),
+        supportsAssignBatch: Boolean(connectedWorker ? connectedWorker.supportsAssignBatch : false),
         dispatchScore: Number(
           connectedWorker && Number.isFinite(connectedWorker.dispatchScore)
             ? connectedWorker.dispatchScore
@@ -951,6 +1007,7 @@ function createStore(options = {}) {
     workerExists,
     getWorker,
     getFirstIdleWorker,
+    getWorkerAvailableSlots: (workerId) => getWorkerAvailableSlots(workers.get(workerId)),
     markWorkerReady,
     markWorkerSeen,
     assignJob,

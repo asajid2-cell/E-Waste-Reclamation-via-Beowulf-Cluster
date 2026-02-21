@@ -1,5 +1,4 @@
 const MAX_JOB_LOOKUP_ID_LENGTH = 128;
-const MAX_SHARDS_PER_JOB = 500000;
 
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -85,9 +84,6 @@ function parseRunJsCreateBody(body, limits) {
       return { ok: false, error: "shardConfig.unitsPerShard must be a positive integer." };
     }
     const totalShards = Math.ceil(totalUnits / unitsPerShard);
-    if (totalShards > MAX_SHARDS_PER_JOB) {
-      return { ok: false, error: `shard count exceeds limit (${MAX_SHARDS_PER_JOB}).` };
-    }
     shardConfig = {
       totalUnits,
       unitsPerShard,
@@ -247,12 +243,26 @@ function sanitizeWorkerCapabilities(value) {
   return { ok: true, value: Object.keys(output).length > 0 ? output : null };
 }
 
+function sanitizeWorkerFeatures(value) {
+  if (value === undefined) {
+    return { ok: true, value: null };
+  }
+  if (!isPlainObject(value)) {
+    return { ok: false, error: "features must be an object." };
+  }
+  const output = {};
+  if (value.assignBatch !== undefined) {
+    output.assignBatch = Boolean(value.assignBatch);
+  }
+  return { ok: true, value: Object.keys(output).length > 0 ? output : null };
+}
+
 function parseWorkerMessage(message) {
   if (!isPlainObject(message) || !isSafeString(message.type, 32)) {
     return { ok: false, error: "Malformed message." };
   }
 
-  const { type, workerId, jobId, result, error, capabilities } = message;
+  const { type, workerId, jobId, result, error, capabilities, features } = message;
   switch (type) {
     case "register":
       if (!isValidWorkerId(workerId)) {
@@ -263,7 +273,17 @@ function parseWorkerMessage(message) {
         if (!parsedCapabilities.ok) {
           return { ok: false, error: parsedCapabilities.error };
         }
-        return { ok: true, type, workerId, capabilities: parsedCapabilities.value };
+        const parsedFeatures = sanitizeWorkerFeatures(features);
+        if (!parsedFeatures.ok) {
+          return { ok: false, error: parsedFeatures.error };
+        }
+        return {
+          ok: true,
+          type,
+          workerId,
+          capabilities: parsedCapabilities.value,
+          features: parsedFeatures.value,
+        };
       }
     case "heartbeat":
       if (!isValidWorkerId(workerId)) {
