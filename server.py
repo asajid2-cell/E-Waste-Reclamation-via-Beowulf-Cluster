@@ -22,13 +22,11 @@ class Job:
 
 def distribute(job):
     docName = "func.txt"
-    with open(docName, "w") as text_file:
-        text_file.write(job.jsFunction)
-    
-    with open(docName, "r") as text_file:
-        print(text_file.read())
 
     for arg in job.args:
+        with open(docName, "w") as text_file:
+            text_file.write("argument = " + str(arg) + ";")
+            text_file.write(job.jsFunction)
         subprocess.run(["mujs", docName])
 
 @app.route("/api/v1/task", methods = ["POST"])
