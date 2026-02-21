@@ -264,6 +264,7 @@ function summarizeTask(job) {
     const summary = {
       op: "run_js",
       executionModel,
+      controlState: job.controlState || "running",
       timeoutMs: task.timeoutMs,
       codeBytes: Buffer.byteLength(String(task.code || ""), "utf8"),
       hasArgs: task.args !== undefined,
@@ -497,9 +498,35 @@ app.post(withBasePath("/api/jobs/run-js"), auth.requireClientAuth, (req, res) =>
   return res.status(201).json({
     jobId: job.jobId,
     status: job.status,
+    controlState: job.controlState || "running",
     executionModel: job.executionModel || "single",
     note: executionNotes.length > 0 ? executionNotes.join(" ") : null,
   });
+});
+
+app.post(withBasePath("/api/jobs/stop-all"), auth.requireClientAuth, (_req, res) => {
+  const stopped = store.stopAllJobs("stopped_by_client");
+  dispatcher.dispatch();
+  return res.json(stopped);
+});
+
+app.post(withBasePath("/api/jobs/:jobId/pause"), auth.requireClientAuth, (req, res) => {
+  const { jobId } = req.params;
+  const paused = store.pauseShardedJob(jobId);
+  if (!paused.ok) {
+    return res.status(400).json({ error: paused.reason });
+  }
+  return res.json(paused);
+});
+
+app.post(withBasePath("/api/jobs/:jobId/resume"), auth.requireClientAuth, (req, res) => {
+  const { jobId } = req.params;
+  const resumed = store.resumeShardedJob(jobId);
+  if (!resumed.ok) {
+    return res.status(400).json({ error: resumed.reason });
+  }
+  dispatcher.dispatch();
+  return res.json(resumed);
 });
 
 app.get(withBasePath("/api/jobs/:jobId"), auth.requireClientAuth, (req, res) => {
@@ -511,6 +538,7 @@ app.get(withBasePath("/api/jobs/:jobId"), auth.requireClientAuth, (req, res) => 
   return res.json({
     jobId: job.jobId,
     status: job.status,
+    controlState: job.controlState || "running",
     executionModel: job.executionModel || "single",
     task: summarizeTask(job),
     result: job.result,
@@ -537,6 +565,7 @@ app.get(withBasePath("/api/jobs/:jobId/events"), auth.requireClientAuth, (req, r
   return res.json({
     jobId: job.jobId,
     status: job.status,
+    controlState: job.controlState || "running",
     executionModel: job.executionModel || "single",
     shardConfig: job.shardConfig || null,
     reducer: job.reducer || null,

@@ -226,11 +226,11 @@
         gap: 0.6rem;
       }
       .raytrace-grid {
-        grid-template-columns: repeat(6, minmax(0, 1fr));
+        grid-template-columns: repeat(7, minmax(0, 1fr));
       }
       .raytrace-actions {
         display: grid;
-        grid-template-columns: auto auto minmax(0, 1fr);
+        grid-template-columns: auto auto auto minmax(0, 1fr);
         gap: 0.6rem;
         align-items: center;
       }
@@ -507,6 +507,16 @@ return hits;</pre>
             <strong>Live Raytrace (Cluster Progressive)</strong>
             <div class="script-options-row raytrace-grid">
               <div class="setting-cell">
+                <label class="setting-label" for="rayScenePreset">Scene</label>
+                <select id="rayScenePreset">
+                  <option value="studio">Studio Spheres</option>
+                  <option value="orb-garden">Orb Garden</option>
+                  <option value="corridor">Box Corridor</option>
+                  <option value="neon-night">Neon Night</option>
+                  <option value="stacked-world">Stacked World</option>
+                </select>
+              </div>
+              <div class="setting-cell">
                 <label class="setting-label" for="rayWidth">Width</label>
                 <input id="rayWidth" type="number" min="64" step="1" value="320" />
               </div>
@@ -533,6 +543,7 @@ return hits;</pre>
             </div>
             <div class="raytrace-actions">
               <button id="startRaytraceBtn" class="warn" type="button">Start Live Raytrace + Open Viewer</button>
+              <button id="stopAllJobsBtn" class="secondary" type="button">Stop All Jobs</button>
               <a id="openRaytraceViewerLink" class="mono raytrace-link" href="#" target="_blank" rel="noopener">Open Raytrace Viewer</a>
               <span id="raytraceHint" class="hint mono">Viewer waits for shard events and refines image in real time.</span>
             </div>
@@ -598,6 +609,7 @@ return hits;</pre>
       const parallelGuidePanelEl = document.getElementById("parallelGuidePanel");
       const openGuidePageLinkEl = document.getElementById("openGuidePageLink");
       const submitScriptBtn = document.getElementById("submitScriptBtn");
+      const rayScenePresetEl = document.getElementById("rayScenePreset");
       const rayWidthEl = document.getElementById("rayWidth");
       const rayHeightEl = document.getElementById("rayHeight");
       const rayTileSizeEl = document.getElementById("rayTileSize");
@@ -605,6 +617,7 @@ return hits;</pre>
       const rayPassesEl = document.getElementById("rayPasses");
       const rayMaxBouncesEl = document.getElementById("rayMaxBounces");
       const startRaytraceBtnEl = document.getElementById("startRaytraceBtn");
+      const stopAllJobsBtnEl = document.getElementById("stopAllJobsBtn");
       const openRaytraceViewerLinkEl = document.getElementById("openRaytraceViewerLink");
       const raytraceHintEl = document.getElementById("raytraceHint");
 
@@ -619,10 +632,59 @@ return hits;</pre>
       const SHARD_MAX_PER_WORKER = 200;
       const SHARD_ABSOLUTE_MAX = Number.MAX_SAFE_INTEGER;
       const RAYTRACE_VIEWER_HTML_PATH = "/raytrace-viewer.html";
+      const RAYTRACE_SCENE_JOBS_KEY = "cluster_raytrace_scene_jobs_v1";
 
       let currentJobId = null;
       let pollTimer = null;
       let workersTimer = null;
+      let activeRaytraceSceneKey = null;
+      let raytraceJobsByScene = (() => {
+        try {
+          const parsed = JSON.parse(localStorage.getItem(RAYTRACE_SCENE_JOBS_KEY) || "{}");
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            return {};
+          }
+          return parsed;
+        } catch (_err) {
+          return {};
+        }
+      })();
+
+      function saveRaytraceSceneJobs() {
+        localStorage.setItem(RAYTRACE_SCENE_JOBS_KEY, JSON.stringify(raytraceJobsByScene));
+      }
+
+      function sceneKeyFromSettings(settings) {
+        return [
+          settings.scenePreset,
+          `${settings.width}x${settings.height}`,
+          `tile=${settings.tileSize}`,
+          `spp=${settings.samplesPerShard}`,
+          `bounces=${settings.maxBounces}`,
+          `passes=${settings.passes}`,
+        ].join("|");
+      }
+
+      function rememberSceneJob(sceneKey, jobId) {
+        if (!sceneKey || !jobId) {
+          return;
+        }
+        raytraceJobsByScene[sceneKey] = jobId;
+        saveRaytraceSceneJobs();
+      }
+
+      function removeSceneJobById(jobId) {
+        let changed = false;
+        for (const [sceneKey, storedJobId] of Object.entries(raytraceJobsByScene)) {
+          if (storedJobId === jobId) {
+            delete raytraceJobsByScene[sceneKey];
+            changed = true;
+          }
+        }
+        if (changed) {
+          saveRaytraceSceneJobs();
+        }
+      }
 
       function raytraceViewerUrl(jobId) {
         const base = withBase(RAYTRACE_VIEWER_HTML_PATH);
@@ -652,6 +714,7 @@ return hits;</pre>
       }
 
       function getRaytraceSettings() {
+        const scenePreset = String(rayScenePresetEl.value || "studio").trim().toLowerCase();
         const width = clampInt(rayWidthEl.value, 64, 1920, 320);
         const height = clampInt(rayHeightEl.value, 64, 1080, 180);
         const tileSize = clampInt(rayTileSizeEl.value, 4, 128, 16);
@@ -659,6 +722,7 @@ return hits;</pre>
         const passes = clampInt(rayPassesEl.value, 1, 20000, 40);
         const maxBounces = clampInt(rayMaxBouncesEl.value, 1, 8, 3);
         return {
+          scenePreset,
           width,
           height,
           tileSize,
@@ -671,6 +735,7 @@ return hits;</pre>
       function buildRaytraceScript() {
         return `const brain = globalThis.__BRAIN__ || {};
 const cfg = args && typeof args === "object" ? args : {};
+const scenePreset = String(cfg.scenePreset || "studio").toLowerCase();
 const width = Math.max(64, Math.min(1920, Number(cfg.width) || 320)) | 0;
 const height = Math.max(64, Math.min(1080, Number(cfg.height) || 180)) | 0;
 const tileSize = Math.max(4, Math.min(128, Number(cfg.tileSize) || 16)) | 0;
@@ -700,46 +765,197 @@ function normalize(x, y, z) {
   const l = len(x, y, z) || 1;
   return [x / l, y / l, z / l];
 }
-function sphereHit(ro, rd, cx, cy, cz, r) {
+function cross(ax, ay, az, bx, by, bz) {
+  return [ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx];
+}
+function reflect(ix, iy, iz, nx, ny, nz) {
+  const d = 2 * dot(ix, iy, iz, nx, ny, nz);
+  return [ix - d * nx, iy - d * ny, iz - d * nz];
+}
+function sphereHit(ro, rd, cx, cy, cz, r, material) {
   const ocx = ro[0] - cx, ocy = ro[1] - cy, ocz = ro[2] - cz;
   const b = dot(ocx, ocy, ocz, rd[0], rd[1], rd[2]);
   const c = dot(ocx, ocy, ocz, ocx, ocy, ocz) - r * r;
   const h = b * b - c;
   if (h < 0) return null;
-  const t = -b - Math.sqrt(h);
-  if (t <= 1e-4) return null;
+  let t = -b - Math.sqrt(h);
+  if (t <= 1e-4) {
+    t = -b + Math.sqrt(h);
+    if (t <= 1e-4) return null;
+  }
   const px = ro[0] + rd[0] * t, py = ro[1] + rd[1] * t, pz = ro[2] + rd[2] * t;
   const nn = normalize(px - cx, py - cy, pz - cz);
-  return { t, px, py, pz, nx: nn[0], ny: nn[1], nz: nn[2] };
+  return { t, px, py, pz, nx: nn[0], ny: nn[1], nz: nn[2], material };
 }
-function scene(ro, rd) {
-  let best = null;
-  function keep(hit, albedo) {
-    if (!hit) return;
-    if (!best || hit.t < best.t) {
-      best = { ...hit, albedo };
+function planeHit(ro, rd, px, py, pz, nx, ny, nz, material) {
+  const denom = dot(rd[0], rd[1], rd[2], nx, ny, nz);
+  if (Math.abs(denom) < 1e-6) return null;
+  const t = dot(px - ro[0], py - ro[1], pz - ro[2], nx, ny, nz) / denom;
+  if (t <= 1e-4) return null;
+  const hx = ro[0] + rd[0] * t, hy = ro[1] + rd[1] * t, hz = ro[2] + rd[2] * t;
+  const normal = denom < 0 ? [nx, ny, nz] : [-nx, -ny, -nz];
+  return { t, px: hx, py: hy, pz: hz, nx: normal[0], ny: normal[1], nz: normal[2], material };
+}
+function boxHit(ro, rd, bmin, bmax, material) {
+  let tmin = -1e30;
+  let tmax = 1e30;
+  let nearNormal = [0, 0, 0];
+  let farNormal = [0, 0, 0];
+  for (let axis = 0; axis < 3; axis += 1) {
+    const inv = Math.abs(rd[axis]) > 1e-9 ? 1 / rd[axis] : 1e30;
+    let t1 = (bmin[axis] - ro[axis]) * inv;
+    let t2 = (bmax[axis] - ro[axis]) * inv;
+    let n1 = [0, 0, 0];
+    let n2 = [0, 0, 0];
+    n1[axis] = -1;
+    n2[axis] = 1;
+    if (t1 > t2) {
+      const tmpT = t1; t1 = t2; t2 = tmpT;
+      const tmpN = n1; n1 = n2; n2 = tmpN;
     }
+    if (t1 > tmin) {
+      tmin = t1;
+      nearNormal = n1;
+    }
+    if (t2 < tmax) {
+      tmax = t2;
+      farNormal = n2;
+    }
+    if (tmax < tmin) return null;
   }
-  keep(sphereHit(ro, rd, 0.0, 0.9, 0.0, 0.9), [0.95, 0.32, 0.28]);
-  keep(sphereHit(ro, rd, -1.6, 0.65, -0.3, 0.65), [0.25, 0.52, 0.95]);
-  keep(sphereHit(ro, rd, 1.55, 0.55, 0.3, 0.55), [0.88, 0.84, 0.3]);
+  let t = tmin;
+  let n = nearNormal;
+  if (t <= 1e-4) {
+    t = tmax;
+    n = farNormal;
+    if (t <= 1e-4) return null;
+  }
+  const hx = ro[0] + rd[0] * t, hy = ro[1] + rd[1] * t, hz = ro[2] + rd[2] * t;
+  return { t, px: hx, py: hy, pz: hz, nx: n[0], ny: n[1], nz: n[2], material };
+}
+function mat(albedo, options) {
+  const opt = options || {};
+  return {
+    albedo: albedo || [0.7, 0.7, 0.7],
+    emission: opt.emission || [0, 0, 0],
+    metalness: Number(opt.metalness) || 0,
+    roughness: Number(opt.roughness) || 0,
+  };
+}
+function sceneForPreset(name) {
+  const objects = [];
+  let camera = { pos: [0, 1.15, 4.2], target: [0, 0.8, 0], fovDeg: 46 };
+  let sun = normalize(0.95, 1.2, 0.55);
+  let skyTop = [0.78, 0.86, 1.0];
+  let skyBottom = [0.2, 0.26, 0.4];
+  function addSphere(x, y, z, r, material) { objects.push({ kind: "sphere", x, y, z, r, material }); }
+  function addPlane(px, py, pz, nx, ny, nz, material) { objects.push({ kind: "plane", px, py, pz, nx, ny, nz, material }); }
+  function addBox(minArr, maxArr, material) { objects.push({ kind: "box", min: minArr, max: maxArr, material }); }
 
-  if (Math.abs(rd[1]) > 1e-6) {
-    const tPlane = -ro[1] / rd[1];
-    if (tPlane > 1e-4 && (!best || tPlane < best.t)) {
-      const px = ro[0] + rd[0] * tPlane;
-      const pz = ro[2] + rd[2] * tPlane;
-      const checker = (((Math.floor(px) + Math.floor(pz)) & 1) === 0) ? 0.85 : 0.22;
-      best = {
-        t: tPlane,
-        px,
-        py: 0,
-        pz,
-        nx: 0,
-        ny: 1,
-        nz: 0,
-        albedo: [checker, checker, checker],
-      };
+  if (name === "orb-garden") {
+    camera = { pos: [0.2, 2.2, 7.7], target: [0, 0.7, -1.4], fovDeg: 40 };
+    sun = normalize(0.35, 1.0, -0.25);
+    skyTop = [0.9, 0.86, 0.74];
+    skyBottom = [0.21, 0.22, 0.34];
+    addPlane(0, 0, 0, 0, 1, 0, mat([0.82, 0.84, 0.9]));
+    const rg = makeRng(123456);
+    for (let z = -5; z <= 2; z += 1) {
+      for (let x = -4; x <= 4; x += 1) {
+        const rr = 0.19 + rg() * 0.22;
+        const ox = (rg() - 0.5) * 0.22;
+        const oz = (rg() - 0.5) * 0.22;
+        const h = rr;
+        const albedo = [0.25 + rg() * 0.7, 0.25 + rg() * 0.7, 0.25 + rg() * 0.7];
+        const metalness = rg() > 0.8 ? 0.85 : 0;
+        const roughness = metalness > 0 ? 0.03 + rg() * 0.2 : 0.5 + rg() * 0.45;
+        addSphere(x + ox, h, z + oz, rr, mat(albedo, { metalness, roughness }));
+      }
+    }
+    addSphere(0, 2.9, -2.2, 0.45, mat([1, 1, 1], { emission: [6.2, 5.7, 4.4] }));
+  } else if (name === "corridor") {
+    camera = { pos: [0, 1.1, 6.3], target: [0, 1.0, -2.0], fovDeg: 43 };
+    sun = normalize(0.2, 1.0, -0.35);
+    skyTop = [0.62, 0.71, 0.82];
+    skyBottom = [0.09, 0.11, 0.17];
+    addPlane(0, 0, 0, 0, 1, 0, mat([0.74, 0.74, 0.74]));
+    addPlane(-2.7, 0, 0, 1, 0, 0, mat([0.66, 0.25, 0.22]));
+    addPlane(2.7, 0, 0, -1, 0, 0, mat([0.2, 0.3, 0.68]));
+    for (let i = 0; i < 7; i += 1) {
+      const z = -1.2 - i * 1.55;
+      addBox([-1.95, 0, z - 0.4], [-1.15, 1.8 + (i % 2) * 0.55, z + 0.4], mat([0.74, 0.74, 0.79]));
+      addBox([1.15, 0, z - 0.4], [1.95, 1.8 + ((i + 1) % 2) * 0.55, z + 0.4], mat([0.74, 0.74, 0.79]));
+      addSphere(0, 2.7, z, 0.22, mat([1, 1, 1], { emission: [5.0, 5.2, 5.6] }));
+    }
+    addSphere(0, 0.9, -3.0, 0.9, mat([0.85, 0.83, 0.3], { metalness: 0.9, roughness: 0.06 }));
+  } else if (name === "neon-night") {
+    camera = { pos: [0.4, 1.0, 4.8], target: [0, 0.75, 0], fovDeg: 47 };
+    sun = normalize(-0.6, 0.95, 0.2);
+    skyTop = [0.16, 0.11, 0.28];
+    skyBottom = [0.02, 0.02, 0.05];
+    addPlane(0, 0, 0, 0, 1, 0, mat([0.08, 0.08, 0.1], { metalness: 0.35, roughness: 0.2 }));
+    addSphere(-1.7, 0.7, -0.8, 0.7, mat([0.18, 0.22, 0.95], { emission: [0.0, 0.0, 3.6] }));
+    addSphere(0.0, 0.95, -0.1, 0.95, mat([0.95, 0.25, 0.75], { metalness: 0.2, roughness: 0.3 }));
+    addSphere(1.65, 0.65, -0.55, 0.65, mat([0.25, 0.95, 0.72], { emission: [0.0, 2.8, 1.7] }));
+    addSphere(-0.2, 1.95, -2.0, 0.45, mat([1, 1, 1], { emission: [5.6, 3.1, 6.0] }));
+    for (let i = 0; i < 10; i += 1) {
+      const z = -0.6 - i * 0.8;
+      const x = (i % 2 === 0 ? -2.25 : 2.25);
+      const c = i % 3;
+      const em = c === 0 ? [3.6, 0.4, 4.2] : c === 1 ? [0.3, 3.8, 2.8] : [3.2, 2.1, 0.3];
+      addSphere(x, 0.3, z, 0.16, mat([1, 1, 1], { emission: em }));
+    }
+  } else if (name === "stacked-world") {
+    camera = { pos: [0.0, 3.6, 8.3], target: [0, 1.1, -1.8], fovDeg: 36 };
+    sun = normalize(0.48, 1.0, -0.22);
+    skyTop = [0.86, 0.92, 1.0];
+    skyBottom = [0.16, 0.2, 0.3];
+    addPlane(0, 0, 0, 0, 1, 0, mat([0.9, 0.9, 0.92]));
+    for (let level = 0; level < 6; level += 1) {
+      const y = 0.28 + level * 0.48;
+      const radius = 2.2 - level * 0.27;
+      const count = 10 + level * 2;
+      for (let i = 0; i < count; i += 1) {
+        const a = (i / count) * Math.PI * 2 + level * 0.12;
+        const x = Math.cos(a) * radius;
+        const z = Math.sin(a) * radius - 2.2;
+        const r = 0.16 + (i % 3) * 0.03;
+        const t = (i + level) % 6;
+        const albedo = [
+          0.25 + (t === 0 || t === 3 ? 0.65 : 0.15),
+          0.25 + (t === 1 || t === 4 ? 0.65 : 0.15),
+          0.25 + (t === 2 || t === 5 ? 0.65 : 0.15),
+        ];
+        addSphere(x, y, z, r, mat(albedo, { roughness: 0.45 + (level * 0.05) }));
+      }
+    }
+    addSphere(0, 3.2, -2.2, 0.65, mat([0.95, 0.9, 0.6], { emission: [2.2, 1.9, 1.2] }));
+  } else {
+    addPlane(0, 0, 0, 0, 1, 0, mat([0.82, 0.82, 0.82]));
+    addSphere(0.0, 0.9, 0.0, 0.9, mat([0.95, 0.32, 0.28], { roughness: 0.45 }));
+    addSphere(-1.6, 0.65, -0.3, 0.65, mat([0.25, 0.52, 0.95], { roughness: 0.4 }));
+    addSphere(1.55, 0.55, 0.3, 0.55, mat([0.88, 0.84, 0.3], { metalness: 0.9, roughness: 0.08 }));
+    addSphere(0.2, 2.7, -1.9, 0.42, mat([1, 1, 1], { emission: [5.4, 4.9, 4.2] }));
+    addBox([-0.45, 0.0, -2.95], [0.45, 0.95, -2.05], mat([0.2, 0.85, 0.72], { roughness: 0.18 }));
+  }
+  return { camera, sun, skyTop, skyBottom, objects };
+}
+const SCENE = sceneForPreset(scenePreset);
+
+function hitScene(ro, rd) {
+  let best = null;
+  for (let i = 0; i < SCENE.objects.length; i += 1) {
+    const obj = SCENE.objects[i];
+    let hit = null;
+    if (obj.kind === "sphere") {
+      hit = sphereHit(ro, rd, obj.x, obj.y, obj.z, obj.r, obj.material);
+    } else if (obj.kind === "plane") {
+      hit = planeHit(ro, rd, obj.px, obj.py, obj.pz, obj.nx, obj.ny, obj.nz, obj.material);
+    } else if (obj.kind === "box") {
+      hit = boxHit(ro, rd, obj.min, obj.max, obj.material);
+    }
+    if (!hit) continue;
+    if (!best || hit.t < best.t) {
+      best = hit;
     }
   }
   return best;
@@ -752,29 +968,31 @@ function cosineHemisphere(nx, ny, nz, rng) {
   const x = r * Math.cos(theta);
   const y = r * Math.sin(theta);
   const z = Math.sqrt(Math.max(0, 1 - u));
-  const upx = Math.abs(ny) < 0.999 ? 0 : 1;
-  const upy = Math.abs(ny) < 0.999 ? 1 : 0;
-  const upz = 0;
-  let tx = ny * upz - nz * upy;
-  let ty = nz * upx - nx * upz;
-  let tz = nx * upy - ny * upx;
-  const tl = len(tx, ty, tz) || 1;
-  tx /= tl; ty /= tl; tz /= tl;
-  const bx = ny * tz - nz * ty;
-  const by = nz * tx - nx * tz;
-  const bz = nx * ty - ny * tx;
-  return normalize(tx * x + bx * y + nx * z, ty * x + by * y + ny * z, tz * x + bz * y + nz * z);
+  const up = Math.abs(ny) < 0.999 ? [0, 1, 0] : [1, 0, 0];
+  let t = cross(up[0], up[1], up[2], nx, ny, nz);
+  t = normalize(t[0], t[1], t[2]);
+  let b = cross(nx, ny, nz, t[0], t[1], t[2]);
+  b = normalize(b[0], b[1], b[2]);
+  return normalize(
+    t[0] * x + b[0] * y + nx * z,
+    t[1] * x + b[1] * y + ny * z,
+    t[2] * x + b[2] * y + nz * z,
+  );
 }
 function sky(dirY) {
   const t = Math.max(0, Math.min(1, 0.5 * (dirY + 1)));
-  return [0.35 + 0.45 * t, 0.45 + 0.4 * t, 0.62 + 0.33 * t];
+  return [
+    SCENE.skyBottom[0] + (SCENE.skyTop[0] - SCENE.skyBottom[0]) * t,
+    SCENE.skyBottom[1] + (SCENE.skyTop[1] - SCENE.skyBottom[1]) * t,
+    SCENE.skyBottom[2] + (SCENE.skyTop[2] - SCENE.skyBottom[2]) * t,
+  ];
 }
 function trace(ro, rd, rng, bounces) {
   let thrR = 1, thrG = 1, thrB = 1;
   let outR = 0, outG = 0, outB = 0;
-  const sun = normalize(1, 1.25, 0.65);
+  const sun = SCENE.sun;
   for (let bounce = 0; bounce < bounces; bounce += 1) {
-    const hit = scene(ro, rd);
+    const hit = hitScene(ro, rd);
     if (!hit) {
       const s = sky(rd[1]);
       outR += thrR * s[0];
@@ -782,43 +1000,63 @@ function trace(ro, rd, rng, bounces) {
       outB += thrB * s[2];
       break;
     }
+    const matRef = hit.material || mat([0.8, 0.8, 0.8]);
+    outR += thrR * (matRef.emission[0] || 0);
+    outG += thrG * (matRef.emission[1] || 0);
+    outB += thrB * (matRef.emission[2] || 0);
+
     const eps = 1e-3;
     const sro = [hit.px + hit.nx * eps, hit.py + hit.ny * eps, hit.pz + hit.nz * eps];
-    const shadow = scene(sro, sun);
-    const visible = !shadow || shadow.t > 50;
-    if (visible) {
+    const shadow = hitScene(sro, sun);
+    const visibleSun = !shadow || shadow.t > 80;
+    if (visibleSun) {
       const ndotl = Math.max(0, dot(hit.nx, hit.ny, hit.nz, sun[0], sun[1], sun[2]));
-      const intensity = 0.9 * ndotl;
-      outR += thrR * hit.albedo[0] * intensity;
-      outG += thrG * hit.albedo[1] * intensity;
-      outB += thrB * hit.albedo[2] * intensity;
+      const intensity = 1.1 * ndotl;
+      outR += thrR * matRef.albedo[0] * intensity;
+      outG += thrG * matRef.albedo[1] * intensity;
+      outB += thrB * matRef.albedo[2] * intensity;
     }
-    thrR *= hit.albedo[0];
-    thrG *= hit.albedo[1];
-    thrB *= hit.albedo[2];
+
+    thrR *= matRef.albedo[0];
+    thrG *= matRef.albedo[1];
+    thrB *= matRef.albedo[2];
     if (bounce >= 2) {
       const p = Math.max(thrR, thrG, thrB);
       if (rng() > p) break;
       const inv = p > 0 ? 1 / p : 1;
       thrR *= inv; thrG *= inv; thrB *= inv;
     }
-    const next = cosineHemisphere(hit.nx, hit.ny, hit.nz, rng);
+
+    let next;
+    if ((matRef.metalness || 0) > 0.5) {
+      const refl = reflect(rd[0], rd[1], rd[2], hit.nx, hit.ny, hit.nz);
+      const fuzz = Math.max(0, Math.min(1, matRef.roughness || 0.02)) * 0.35;
+      next = normalize(
+        refl[0] + (rng() * 2 - 1) * fuzz,
+        refl[1] + (rng() * 2 - 1) * fuzz,
+        refl[2] + (rng() * 2 - 1) * fuzz,
+      );
+    } else {
+      next = cosineHemisphere(hit.nx, hit.ny, hit.nz, rng);
+    }
     ro = sro;
     rd = next;
   }
   return [outR, outG, outB];
 }
 
-const camPos = [0, 1.15, 4.1];
-const camTarget = [0, 0.82, 0];
+const camPos = SCENE.camera.pos;
+const camTarget = SCENE.camera.target;
 const forward = normalize(camTarget[0] - camPos[0], camTarget[1] - camPos[1], camTarget[2] - camPos[2]);
-const right = normalize(forward[2], 0, -forward[0]);
-const up = normalize(
-  right[1] * forward[2] - right[2] * forward[1],
-  right[2] * forward[0] - right[0] * forward[2],
-  right[0] * forward[1] - right[1] * forward[0],
-);
-const fov = 46 * Math.PI / 180;
+const worldUp = [0, 1, 0];
+let rightRaw = cross(forward[0], forward[1], forward[2], worldUp[0], worldUp[1], worldUp[2]);
+if (len(rightRaw[0], rightRaw[1], rightRaw[2]) < 1e-6) {
+  rightRaw = [1, 0, 0];
+}
+const right = normalize(rightRaw[0], rightRaw[1], rightRaw[2]);
+const upRaw = cross(right[0], right[1], right[2], forward[0], forward[1], forward[2]);
+const up = normalize(upRaw[0], upRaw[1], upRaw[2]);
+const fov = (SCENE.camera.fovDeg || 46) * Math.PI / 180;
 const invW = 1 / width;
 const invH = 1 / height;
 const aspect = width / height;
@@ -863,6 +1101,7 @@ for (let py = 0; py < tileH; py += 1) {
 
 return {
   mode: "raytrace_tile_v1",
+  scenePreset,
   width,
   height,
   tileX,
@@ -914,6 +1153,34 @@ return {
         }
 
         return data;
+      }
+
+      async function pauseShardedJob(jobId) {
+        if (!jobId) {
+          return false;
+        }
+        try {
+          await apiFetch(withBase(`/api/jobs/${encodeURIComponent(jobId)}/pause`), {
+            method: "POST",
+          });
+          return true;
+        } catch (_err) {
+          return false;
+        }
+      }
+
+      async function resumeShardedJob(jobId) {
+        if (!jobId) {
+          return false;
+        }
+        try {
+          await apiFetch(withBase(`/api/jobs/${encodeURIComponent(jobId)}/resume`), {
+            method: "POST",
+          });
+          return true;
+        } catch (_err) {
+          return false;
+        }
       }
 
       function formatResult(value) {
@@ -1004,6 +1271,7 @@ return {
         submitAddBtn.disabled = isBusy;
         submitScriptBtn.disabled = isBusy;
         startRaytraceBtnEl.disabled = isBusy;
+        stopAllJobsBtnEl.disabled = isBusy;
       }
 
       function detectExecutionModelFromInputs() {
@@ -1185,6 +1453,10 @@ return {
           errorEl.textContent = data.error == null ? "-" : data.error;
 
           if (data.status === "done" || data.status === "failed") {
+            removeSceneJobById(jobId);
+            if (currentJobId === jobId && activeRaytraceSceneKey && raytraceJobsByScene[activeRaytraceSceneKey] === jobId) {
+              activeRaytraceSceneKey = null;
+            }
             clearInterval(pollTimer);
             pollTimer = null;
             setBusy(false);
@@ -1289,6 +1561,33 @@ return {
         }
 
         const settings = getRaytraceSettings();
+        const sceneKey = sceneKeyFromSettings(settings);
+        const existingJobId = raytraceJobsByScene[sceneKey];
+        if (existingJobId) {
+          const resumed = await resumeShardedJob(existingJobId);
+          if (resumed) {
+            currentJobId = existingJobId;
+            jobIdEl.textContent = currentJobId;
+            setStatus("running");
+            activeRaytraceSceneKey = sceneKey;
+            updateRaytraceViewerLink();
+            if (pollTimer) {
+              clearInterval(pollTimer);
+            }
+            pollTimer = setInterval(() => {
+              pollJob(currentJobId);
+            }, 800);
+            pollJob(currentJobId);
+            const viewerUrl = raytraceViewerUrl(existingJobId);
+            window.open(viewerUrl, "_blank", "noopener");
+            raytraceHintEl.textContent = "Resumed existing scene job from previous detail state.";
+            raytraceHintEl.className = "hint mono ok";
+            return;
+          }
+          delete raytraceJobsByScene[sceneKey];
+          saveRaytraceSceneJobs();
+        }
+
         const tilesX = Math.ceil(settings.width / settings.tileSize);
         const tilesY = Math.ceil(settings.height / settings.tileSize);
         const totalShards = Math.max(1, tilesX * tilesY * settings.passes);
@@ -1311,8 +1610,84 @@ return {
         if (!created || !created.jobId) {
           return;
         }
+        activeRaytraceSceneKey = sceneKey;
+        rememberSceneJob(sceneKey, created.jobId);
         const viewerUrl = raytraceViewerUrl(created.jobId);
         window.open(viewerUrl, "_blank", "noopener");
+      });
+
+      stopAllJobsBtnEl.addEventListener("click", async () => {
+        try {
+          const stopped = await apiFetch(withBase("/api/jobs/stop-all"), {
+            method: "POST",
+          });
+          if (pollTimer) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+          }
+          currentJobId = null;
+          activeRaytraceSceneKey = null;
+          raytraceJobsByScene = {};
+          saveRaytraceSceneJobs();
+          jobIdEl.textContent = "-";
+          setStatus("idle");
+          updateRaytraceViewerLink();
+          raytraceHintEl.textContent = `Stopped ${Number(stopped.stopped || 0)} active job(s).`;
+          raytraceHintEl.className = "hint mono ok";
+          setBusy(false);
+        } catch (err) {
+          errorEl.textContent = err.message;
+        }
+      });
+
+      rayScenePresetEl.addEventListener("change", async () => {
+        const newSettings = getRaytraceSettings();
+        const newSceneKey = sceneKeyFromSettings(newSettings);
+        if (activeRaytraceSceneKey && activeRaytraceSceneKey !== newSceneKey) {
+          const oldJobId = raytraceJobsByScene[activeRaytraceSceneKey];
+          if (oldJobId) {
+            const paused = await pauseShardedJob(oldJobId);
+            if (paused) {
+              raytraceHintEl.textContent = "Paused previous scene job.";
+              raytraceHintEl.className = "hint mono warn-text";
+            }
+          }
+        }
+
+        const resumeJobId = raytraceJobsByScene[newSceneKey];
+        if (!resumeJobId) {
+          activeRaytraceSceneKey = newSceneKey;
+          raytraceHintEl.textContent = "No saved job for this scene. Start a new live raytrace.";
+          raytraceHintEl.className = "hint mono";
+          return;
+        }
+
+        const resumed = await resumeShardedJob(resumeJobId);
+        if (!resumed) {
+          delete raytraceJobsByScene[newSceneKey];
+          saveRaytraceSceneJobs();
+          activeRaytraceSceneKey = newSceneKey;
+          raytraceHintEl.textContent = "Saved scene job was unavailable. Start a new live raytrace.";
+          raytraceHintEl.className = "hint mono warn-text";
+          return;
+        }
+
+        activeRaytraceSceneKey = newSceneKey;
+        currentJobId = resumeJobId;
+        jobIdEl.textContent = currentJobId;
+        updateRaytraceViewerLink();
+        setStatus("running");
+        if (pollTimer) {
+          clearInterval(pollTimer);
+        }
+        pollTimer = setInterval(() => {
+          pollJob(currentJobId);
+        }, 800);
+        pollJob(currentJobId);
+        const viewerUrl = raytraceViewerUrl(resumeJobId);
+        window.open(viewerUrl, "_blank", "noopener");
+        raytraceHintEl.textContent = "Resumed saved scene job and continued from prior detail.";
+        raytraceHintEl.className = "hint mono ok";
       });
 
       submitScriptBtn.addEventListener("click", async () => {
@@ -1424,6 +1799,7 @@ return {
       }
       openGuidePageLinkEl.href = withBase("/parallel-guide.html");
       openRaytraceViewerLinkEl.href = raytraceViewerUrl(null);
+      activeRaytraceSceneKey = sceneKeyFromSettings(getRaytraceSettings());
       updateRaytraceViewerLink();
       refreshAutoModeUi();
       refreshReducerUi();

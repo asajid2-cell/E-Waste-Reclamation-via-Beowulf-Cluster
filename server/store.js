@@ -466,6 +466,7 @@ function createStore(options = {}) {
       jobId,
       task,
       status: createOptions.status || "queued",
+      controlState: createOptions.controlState || "running",
       result: null,
       error: null,
       assignedWorkerId: null,
@@ -498,6 +499,14 @@ function createStore(options = {}) {
     return job;
   }
 
+  function removeFromQueue(jobId) {
+    for (let i = queue.length - 1; i >= 0; i -= 1) {
+      if (queue[i] === jobId) {
+        queue.splice(i, 1);
+      }
+    }
+  }
+
   function createShardedRunJsJob(task) {
     const shardConfig = task.shardConfig;
     const reducer = task.reducer;
@@ -505,6 +514,7 @@ function createStore(options = {}) {
     const parentJob = createJob(task, {
       skipQueue: true,
       status: "running",
+      controlState: "running",
       executionModel: "sharded",
       maxAttempts: 1,
       totalShards,
@@ -584,12 +594,35 @@ function createStore(options = {}) {
   }
 
   function dequeueQueuedJob() {
-    const nextJob = getNextQueuedJob();
-    if (!nextJob) {
+    if (queue.length === 0) {
       return null;
     }
-    queue.shift();
-    return nextJob;
+
+    const initialLen = queue.length;
+    for (let i = 0; i < initialLen; i += 1) {
+      const jobId = queue.shift();
+      const job = jobs.get(jobId);
+      if (!job || job.status !== "queued") {
+        continue;
+      }
+
+      if (job.parentJobId) {
+        const parent = jobs.get(job.parentJobId);
+        if (!parent || parent.status === "failed" || parent.status === "done" || parent.controlState === "cancelled") {
+          job.status = "failed";
+          job.error = "parent_inactive";
+          touchJob(job);
+          continue;
+        }
+        if (parent.controlState === "paused") {
+          queue.push(jobId);
+          continue;
+        }
+      }
+
+      return job;
+    }
+    return null;
   }
 
   function requeueJob(jobId, front = false) {
@@ -612,6 +645,131 @@ function createStore(options = {}) {
     } else {
       queue.push(jobId);
     }
+  }
+
+  function cancelAssignedJob(job, reason) {
+    if (!job) {
+      return false;
+    }
+    const assignedWorkerId = assignments.get(job.jobId);
+    if (!assignedWorkerId) {
+      return false;
+    }
+    assignments.delete(job.jobId);
+    const worker = workers.get(assignedWorkerId);
+    if (worker) {
+      worker.inFlightCount = Math.max(0, (worker.inFlightCount || 0) - 1);
+      worker.lastSeenAt = Date.now();
+      refreshWorkerState(worker);
+    }
+    job.status = "failed";
+    job.error = reason || "cancelled";
+    job.assignedWorkerId = null;
+    job.assignedAtMs = null;
+    touchJob(job);
+    return true;
+  }
+
+  function pauseShardedJob(jobId) {
+    const job = jobs.get(jobId);
+    if (!job || job.hidden) {
+      return { ok: false, reason: "job_not_found" };
+    }
+    if ((job.executionModel || "single") !== "sharded") {
+      return { ok: false, reason: "not_sharded" };
+    }
+    if (job.status === "done" || job.status === "failed") {
+      return { ok: false, reason: "terminal" };
+    }
+    job.controlState = "paused";
+    touchJob(job);
+    appendJobEvent(job.jobId, {
+      type: "job_paused",
+      jobId: job.jobId,
+      completedShards: Number(job.completedShards || 0),
+      totalShards: Number(job.totalShards || 0),
+    });
+    return { ok: true, jobId: job.jobId, controlState: job.controlState };
+  }
+
+  function resumeShardedJob(jobId) {
+    const job = jobs.get(jobId);
+    if (!job || job.hidden) {
+      return { ok: false, reason: "job_not_found" };
+    }
+    if ((job.executionModel || "single") !== "sharded") {
+      return { ok: false, reason: "not_sharded" };
+    }
+    if (job.status === "done" || job.status === "failed") {
+      return { ok: false, reason: "terminal" };
+    }
+    job.controlState = "running";
+    touchJob(job);
+    appendJobEvent(job.jobId, {
+      type: "job_resumed",
+      jobId: job.jobId,
+      completedShards: Number(job.completedShards || 0),
+      totalShards: Number(job.totalShards || 0),
+    });
+    return { ok: true, jobId: job.jobId, controlState: job.controlState };
+  }
+
+  function cancelJob(jobId, reason = "cancelled") {
+    const job = jobs.get(jobId);
+    if (!job || job.hidden) {
+      return { ok: false, reason: "job_not_found" };
+    }
+    if (job.status === "done" || job.status === "failed") {
+      return { ok: true, alreadyTerminal: true };
+    }
+
+    removeFromQueue(jobId);
+    cancelAssignedJob(job, reason);
+    job.status = "failed";
+    job.error = reason;
+    job.controlState = "cancelled";
+    touchJob(job);
+
+    if ((job.executionModel || "single") === "sharded" && Array.isArray(job.childJobIds)) {
+      for (const childJobId of job.childJobIds) {
+        const child = jobs.get(childJobId);
+        if (!child) {
+          continue;
+        }
+        removeFromQueue(childJobId);
+        cancelAssignedJob(child, "parent_cancelled");
+        if (child.status !== "done" && child.status !== "failed") {
+          child.status = "failed";
+          child.error = "parent_cancelled";
+          touchJob(child);
+        }
+      }
+      appendJobEvent(job.jobId, {
+        type: "job_cancelled",
+        jobId: job.jobId,
+        completedShards: Number(job.completedShards || 0),
+        failedShards: Number(job.failedShards || 0),
+        totalShards: Number(job.totalShards || 0),
+        reason,
+      });
+    }
+
+    return { ok: true };
+  }
+
+  function stopAllJobs(reason = "stopped_by_client") {
+    const snapshot = Array.from(jobs.values()).filter((job) => !job.hidden);
+    let stopped = 0;
+    for (const job of snapshot) {
+      if (job.status === "done" || job.status === "failed") {
+        continue;
+      }
+      const stoppedResult = cancelJob(job.jobId, reason);
+      if (stoppedResult.ok) {
+        stopped += 1;
+      }
+    }
+    return { ok: true, stopped };
   }
 
   function registerWorker(workerId, ws, capabilities = null, features = null) {
@@ -837,6 +995,12 @@ function createStore(options = {}) {
     }
 
     assignments.delete(jobId);
+    if (job.status === "failed" || job.controlState === "cancelled") {
+      worker.inFlightCount = Math.max(0, (worker.inFlightCount || 0) - 1);
+      worker.lastSeenAt = Date.now();
+      refreshWorkerState(worker);
+      return { ok: true, ignored: true };
+    }
     job.status = "done";
     job.result = normalizedResult;
     job.error = null;
@@ -929,6 +1093,12 @@ function createStore(options = {}) {
     }
 
     assignments.delete(jobId);
+    if (job.status === "failed" || job.controlState === "cancelled") {
+      worker.inFlightCount = Math.max(0, (worker.inFlightCount || 0) - 1);
+      worker.lastSeenAt = Date.now();
+      refreshWorkerState(worker);
+      return { ok: true, ignored: true };
+    }
     worker.inFlightCount = Math.max(0, (worker.inFlightCount || 0) - 1);
     worker.lastSeenAt = Date.now();
     refreshWorkerState(worker);
@@ -1120,6 +1290,10 @@ function createStore(options = {}) {
     createJob,
     createShardedRunJsJob,
     getJob,
+    pauseShardedJob,
+    resumeShardedJob,
+    cancelJob,
+    stopAllJobs,
     dequeueQueuedJob,
     requeueJob,
     registerWorker,
