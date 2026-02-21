@@ -258,8 +258,31 @@ infer_proxy_type_from_image() {
     printf '%s' "caddy"
     return 0
   fi
-  if [[ "${image_lc}" == *nginx* ]]; then
+  if [[ "${image_lc}" == *nginx* || "${image_lc}" == *openresty* ]]; then
     printf '%s' "nginx"
+    return 0
+  fi
+  if [[ "${image_lc}" == *traefik* ]]; then
+    printf '%s' "traefik"
+    return 0
+  fi
+  return 1
+}
+
+infer_proxy_type_from_container_mounts() {
+  local container_name="$1"
+  local destinations
+  destinations="$(docker inspect --format '{{range .Mounts}}{{println .Destination}}{{end}}' "${container_name}" 2>/dev/null || true)"
+  if printf '%s' "${destinations}" | grep -q '/etc/caddy'; then
+    printf '%s' "caddy"
+    return 0
+  fi
+  if printf '%s' "${destinations}" | grep -q '/etc/nginx'; then
+    printf '%s' "nginx"
+    return 0
+  fi
+  if printf '%s' "${destinations}" | grep -q '/etc/traefik'; then
+    printf '%s' "traefik"
     return 0
   fi
   return 1
@@ -281,6 +304,9 @@ detect_docker_proxy_container() {
     image="$(docker inspect --format '{{.Config.Image}}' "${DOCKER_PROXY_CONTAINER}")"
     DOCKER_PROXY_TYPE="$(infer_proxy_type_from_image "${image}" || true)"
     if [[ -z "${DOCKER_PROXY_TYPE}" ]]; then
+      DOCKER_PROXY_TYPE="$(infer_proxy_type_from_container_mounts "${DOCKER_PROXY_CONTAINER}" || true)"
+    fi
+    if [[ -z "${DOCKER_PROXY_TYPE}" ]]; then
       fail "Unsupported docker proxy image: ${image}"
     fi
     return 0
@@ -288,6 +314,8 @@ detect_docker_proxy_container() {
 
   local lines=()
   local line
+  local fallback_name=""
+  local fallback_image=""
   mapfile -t lines < <(docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}')
 
   for line in "${lines[@]}"; do
@@ -298,12 +326,26 @@ detect_docker_proxy_container() {
     local proxy_type
     proxy_type="$(infer_proxy_type_from_image "${image}" || true)"
     if [[ -z "${proxy_type}" ]]; then
+      proxy_type="$(infer_proxy_type_from_container_mounts "${name}" || true)"
+    fi
+    if [[ -z "${proxy_type}" ]]; then
+      if [[ -z "${fallback_name}" ]]; then
+        fallback_name="${name}"
+        fallback_image="${image}"
+      fi
       continue
     fi
     DOCKER_PROXY_CONTAINER="${name}"
     DOCKER_PROXY_TYPE="${proxy_type}"
     return 0
   done
+
+  if [[ -n "${fallback_name}" ]]; then
+    DOCKER_PROXY_CONTAINER="${fallback_name}"
+    DOCKER_PROXY_TYPE="unknown"
+    mark_note "Found potential proxy container ${fallback_name} (${fallback_image}) but proxy type could not be inferred."
+    return 0
+  fi
 
   return 1
 }
@@ -781,25 +823,56 @@ fi
 if [[ "${effective_proxy_mode}" == "auto" ]]; then
   if [[ -n "${detected_host_nginx_conf}" ]]; then
     effective_proxy_mode="host-nginx"
-  else
+  elif detect_docker_proxy_container && [[ "${DOCKER_PROXY_TYPE}" != "unknown" ]]; then
     effective_proxy_mode="docker-proxy"
+  else
+    effective_proxy_mode="host-nginx"
+    mark_pending "Could not confidently detect docker proxy container; falling back to host nginx setup."
   fi
 fi
 mark_done "Proxy mode selected: ${effective_proxy_mode}."
 
 if [[ "${effective_proxy_mode}" == "host-nginx" ]]; then
+  created_fallback_nginx_conf="0"
   NGINX_SITE_CONF="${detected_host_nginx_conf}"
   if [[ -z "${NGINX_SITE_CONF}" ]]; then
-    fail "Could not find nginx site config with server_name ${DOMAIN}. Use --proxy-mode docker-proxy or pass --nginx-site-conf."
-  fi
-  if [[ ! -f "${NGINX_SITE_CONF}" ]]; then
+    NGINX_SITE_CONF="/etc/nginx/sites-available/${SERVICE_NAME}-${DOMAIN}.conf"
+    cat > "${NGINX_SITE_CONF}" <<EOF
+server {
+    listen 80;
+    server_name ${DOMAIN};
+
+    location = ${BASE_PATH} {
+        return 302 ${BASE_PATH}/client;
+    }
+
+    location ^~ ${BASE_PATH}/ {
+        proxy_pass http://${APP_HOST}:${APP_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+EOF
+    ln -sf "${NGINX_SITE_CONF}" "/etc/nginx/sites-enabled/${SERVICE_NAME}-${DOMAIN}.conf"
+    mark_done "Created fallback nginx site ${NGINX_SITE_CONF}."
+    mark_pending "Fallback nginx site is HTTP-only unless your existing TLS setup terminates elsewhere."
+    created_fallback_nginx_conf="1"
+  elif [[ ! -f "${NGINX_SITE_CONF}" ]]; then
     fail "Nginx site config not found: ${NGINX_SITE_CONF}"
   fi
 
-  NGINX_SNIPPET="/etc/nginx/snippets/${SERVICE_NAME}.conf"
-  log "Writing nginx location snippet ${NGINX_SNIPPET}"
-  install -d /etc/nginx/snippets
-  cat > "${NGINX_SNIPPET}" <<EOF
+  if [[ "${created_fallback_nginx_conf}" == "0" ]]; then
+    NGINX_SNIPPET="/etc/nginx/snippets/${SERVICE_NAME}.conf"
+    log "Writing nginx location snippet ${NGINX_SNIPPET}"
+    install -d /etc/nginx/snippets
+    cat > "${NGINX_SNIPPET}" <<EOF
 # Managed by ${SERVICE_NAME} setup script
 location = ${BASE_PATH} {
     return 302 ${BASE_PATH}/client;
@@ -818,17 +891,18 @@ location ^~ ${BASE_PATH}/ {
     proxy_send_timeout 300s;
 }
 EOF
-  mark_done "Wrote nginx snippet ${NGINX_SNIPPET}."
+    mark_done "Wrote nginx snippet ${NGINX_SNIPPET}."
 
-  include_line="include ${NGINX_SNIPPET};"
-  if ! grep -Fq "${include_line}" "${NGINX_SITE_CONF}"; then
-    log "Injecting nginx include into ${NGINX_SITE_CONF}"
-    cp "${NGINX_SITE_CONF}" "${NGINX_SITE_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-    domain_regex="$(escape_regex "${DOMAIN}")"
-    sed -i "/server_name[[:space:]].*${domain_regex}/a\\    ${include_line}" "${NGINX_SITE_CONF}"
-    mark_done "Injected nginx include into ${NGINX_SITE_CONF}."
-  else
-    mark_done "Nginx include already present in ${NGINX_SITE_CONF}."
+    include_line="include ${NGINX_SNIPPET};"
+    if ! grep -Fq "${include_line}" "${NGINX_SITE_CONF}"; then
+      log "Injecting nginx include into ${NGINX_SITE_CONF}"
+      cp "${NGINX_SITE_CONF}" "${NGINX_SITE_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+      domain_regex="$(escape_regex "${DOMAIN}")"
+      sed -i "/server_name[[:space:]].*${domain_regex}/a\\    ${include_line}" "${NGINX_SITE_CONF}"
+      mark_done "Injected nginx include into ${NGINX_SITE_CONF}."
+    else
+      mark_done "Nginx include already present in ${NGINX_SITE_CONF}."
+    fi
   fi
 
   log "Testing and reloading nginx"
