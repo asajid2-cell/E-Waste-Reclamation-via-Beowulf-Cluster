@@ -646,6 +646,109 @@ if changed:
 PY
 }
 
+patch_active_tls_nginx_domain_files() {
+  local include_line="$1"
+  DOMAIN="${DOMAIN}" BASE_PATH="${BASE_PATH}" INCLUDE_LINE="${include_line}" python3 - <<'PY'
+import os
+import pathlib
+import re
+
+domain = os.environ["DOMAIN"]
+base_path = os.environ["BASE_PATH"]
+include_stmt = os.environ["INCLUDE_LINE"].strip()
+roots = [pathlib.Path("/etc/nginx/sites-enabled"), pathlib.Path("/etc/nginx/conf.d")]
+
+paths = []
+for root in roots:
+    if root.exists():
+        for p in root.glob("*"):
+            if p.is_file():
+                paths.append(p)
+
+srv_open = re.compile(r"^\s*server\s*\{")
+srv_name = re.compile(r"^\s*server_name\b")
+listen_443 = re.compile(r"^\s*listen\s+[^;]*443")
+loc_cluster = re.compile(rf"^\s*location\s+(?:=|\^~|~\*|~)?\s*{re.escape(base_path)}(?:/)?\s*\{{")
+inc_line_exact = re.compile(r"^\s*" + re.escape(include_stmt) + r"\s*$")
+inc_line_cluster_app = re.compile(r"^\s*include\s+/etc/nginx/snippets/cluster-app\.conf;\s*$")
+
+def strip_cluster_locations(block):
+    out, i, changed = [], 0, False
+    while i < len(block):
+        line = block[i]
+        if loc_cluster.search(line):
+            changed = True
+            depth = line.count("{") - line.count("}")
+            i += 1
+            while i < len(block) and depth > 0:
+                depth += block[i].count("{") - block[i].count("}")
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    return out, changed
+
+patched = []
+for path in paths:
+    txt = path.read_text(encoding="utf-8", errors="ignore")
+    lines = txt.splitlines()
+    orig = lines[:]
+    blocks = []
+    i = 0
+    while i < len(lines):
+        if srv_open.search(lines[i]):
+            depth = lines[i].count("{") - lines[i].count("}")
+            j = i + 1
+            while j < len(lines):
+                depth += lines[j].count("{") - lines[j].count("}")
+                if depth == 0:
+                    blocks.append((i, j))
+                    break
+                j += 1
+            i = j
+        i += 1
+
+    changed = False
+    for s, e in reversed(blocks):
+        block = lines[s:e + 1]
+        block_text = "\n".join(block)
+        if domain not in block_text:
+            continue
+        if not any(listen_443.search(x) for x in block):
+            continue
+        if not any(srv_name.search(x) for x in block):
+            continue
+
+        b2, c1 = strip_cluster_locations(block)
+        b3 = [x for x in b2 if not inc_line_exact.search(x) and not inc_line_cluster_app.search(x)]
+        if c1 or len(b3) != len(block):
+            changed = True
+
+        insert_after = None
+        for idx, ln in enumerate(b3):
+            if srv_name.search(ln):
+                insert_after = idx
+        if insert_after is None:
+            insert_after = 0
+
+        indent = "    "
+        m = re.match(r"^(\s*)", b3[insert_after]) if 0 <= insert_after < len(b3) else None
+        if m:
+            indent = m.group(1)
+        b3.insert(insert_after + 1, f"{indent}{include_stmt}")
+        changed = True
+
+        lines[s:e + 1] = b3
+
+    if changed and lines != orig:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        patched.append(str(path))
+
+for p in patched:
+    print(p)
+PY
+}
+
 infer_proxy_type_from_image() {
   local image_lc
   image_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
@@ -1384,32 +1487,38 @@ EOF
     mark_done "Wrote nginx snippet ${NGINX_SNIPPET}."
 
     include_line="include ${NGINX_SNIPPET};"
-    if [[ "${#detected_host_nginx_confs[@]}" -eq 0 ]]; then
-      detected_host_nginx_confs=("${NGINX_SITE_CONF}")
-    fi
-
-    local_conf_count=0
-    for conf_path in "${detected_host_nginx_confs[@]}"; do
-      [[ -z "${conf_path}" ]] && continue
-      if [[ ! -f "${conf_path}" ]]; then
-        mark_pending "Detected nginx conf missing on disk: ${conf_path}"
-        continue
-      fi
-      if grep -Fq "include /etc/nginx/snippets/${SERVICE_NAME}.conf;" "${conf_path}"; then
-        sed -i "\|include /etc/nginx/snippets/${SERVICE_NAME}.conf;|d" "${conf_path}"
-      fi
-      log "Ensuring nginx include is present in domain server blocks in ${conf_path}"
-      if ensure_nginx_include_in_domain_servers "${conf_path}" "${include_line}"; then
-        local_conf_count=$((local_conf_count + 1))
-      else
-        mark_pending "Could not patch nginx config automatically: ${conf_path}"
-      fi
-    done
-    if (( local_conf_count > 0 )); then
-      mark_done "Ensured nginx include is configured for ${DOMAIN} server blocks in ${local_conf_count} nginx file(s)."
-      mark_note "Patched nginx files: ${detected_host_nginx_confs[*]}"
+    mapfile -t tls_patched_files < <(patch_active_tls_nginx_domain_files "${include_line}" || true)
+    if [[ "${#tls_patched_files[@]}" -gt 0 ]]; then
+      mark_done "Patched active TLS nginx files for ${DOMAIN} (${#tls_patched_files[@]} file(s))."
+      mark_note "Patched nginx files: ${tls_patched_files[*]}"
     else
-      mark_pending "Did not patch any nginx files for ${DOMAIN}; verify server_name blocks exist in active config."
+      if [[ "${#detected_host_nginx_confs[@]}" -eq 0 ]]; then
+        detected_host_nginx_confs=("${NGINX_SITE_CONF}")
+      fi
+
+      local_conf_count=0
+      for conf_path in "${detected_host_nginx_confs[@]}"; do
+        [[ -z "${conf_path}" ]] && continue
+        if [[ ! -f "${conf_path}" ]]; then
+          mark_pending "Detected nginx conf missing on disk: ${conf_path}"
+          continue
+        fi
+        if grep -Fq "include /etc/nginx/snippets/${SERVICE_NAME}.conf;" "${conf_path}"; then
+          sed -i "\|include /etc/nginx/snippets/${SERVICE_NAME}.conf;|d" "${conf_path}"
+        fi
+        log "Ensuring nginx include is present in domain server blocks in ${conf_path}"
+        if ensure_nginx_include_in_domain_servers "${conf_path}" "${include_line}"; then
+          local_conf_count=$((local_conf_count + 1))
+        else
+          mark_pending "Could not patch nginx config automatically: ${conf_path}"
+        fi
+      done
+      if (( local_conf_count > 0 )); then
+        mark_done "Ensured nginx include is configured for ${DOMAIN} server blocks in ${local_conf_count} nginx file(s)."
+        mark_note "Patched nginx files: ${detected_host_nginx_confs[*]}"
+      else
+        mark_pending "Did not patch any nginx files for ${DOMAIN}; verify server_name blocks exist in active config."
+      fi
     fi
   fi
 
@@ -1420,6 +1529,11 @@ EOF
 else
   configure_docker_proxy_route
 fi
+
+# Final forced restart to guarantee latest .env key material is loaded.
+log "Performing final restart of ${SERVICE_NAME} to apply runtime config changes"
+systemctl restart "${SERVICE_NAME}"
+mark_done "Performed final restart of ${SERVICE_NAME} after proxy/config updates."
 
 EDGE_HEALTH_HTTPS_URL="https://${DOMAIN}${BASE_PATH}/health"
 edge_https_status="$(curl -ksS -o /dev/null -w '%{http_code}' --resolve "${DOMAIN}:443:127.0.0.1" "${EDGE_HEALTH_HTTPS_URL}" || true)"
