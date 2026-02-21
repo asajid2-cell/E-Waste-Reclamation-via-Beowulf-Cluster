@@ -1,10 +1,13 @@
 ﻿const path = require("node:path");
 const http = require("node:http");
 const { URL } = require("node:url");
+const { randomBytes } = require("node:crypto");
 
 const express = require("express");
 const rateLimit = require("express-rate-limit");
 const helmet = require("helmet");
+const QRCode = require("qrcode");
+const { wordlists } = require("bip39");
 const { WebSocketServer } = require("ws");
 
 const { createStore, isValidInputNumber, MIN_VALUE, MAX_VALUE } = require("./store");
@@ -23,6 +26,11 @@ const WS_MAX_CONNECTIONS_PER_IP = Number(process.env.WS_MAX_CONNECTIONS_PER_IP |
 const WS_MAX_MESSAGES_PER_WINDOW = Number(process.env.WS_MAX_MESSAGES_PER_WINDOW || 120);
 const WS_MESSAGE_WINDOW_MS = Number(process.env.WS_MESSAGE_WINDOW_MS || 10_000);
 const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || "128kb";
+const SHORT_INVITE_CODE_LENGTH = Math.min(Math.max(Number(process.env.SHORT_INVITE_CODE_LENGTH || 7), 4), 16);
+const SHORT_INVITE_MAX_ACTIVE = Math.min(Math.max(Number(process.env.SHORT_INVITE_MAX_ACTIVE || 50000), 100), 500000);
+const SHORT_INVITE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+const WORKER_INVITE_PHRASE_WORDS = Math.min(Math.max(Number(process.env.WORKER_INVITE_PHRASE_WORDS || 8), 3), 8);
+const WORKER_INVITE_PHRASE_ALPHABET_SIZE = 2048;
 
 function normalizeBasePath(input) {
   if (!input || input === "/") {
@@ -45,6 +53,8 @@ const API_BASE_PATH = withBasePath("/api");
 const WS_WORKER_PATH = withBasePath("/ws/worker");
 const CLIENT_PATH = withBasePath("/client");
 const WORKER_PATH = withBasePath("/worker");
+const SHORT_INVITE_PATH = withBasePath("/j");
+const PHRASE_INVITE_PATH = withBasePath("/p");
 const APP_ROOT_PATH = BASE_PATH || "/";
 
 const config = resolveConfig();
@@ -55,6 +65,100 @@ const store = createStore({
   maxCustomResultBytes: config.customJobMaxResultBytes,
 });
 const dispatcher = createDispatcher(store, auth, console);
+const shortInvites = new Map();
+const phraseInvites = new Map();
+const phraseWordlist = wordlists.english;
+
+function pruneExpiredShortInvites(nowMs = Date.now()) {
+  for (const [code, record] of shortInvites.entries()) {
+    if (!record || typeof record.expiresAtMs !== "number" || record.expiresAtMs <= nowMs) {
+      shortInvites.delete(code);
+    }
+  }
+  for (const [phraseSlug, record] of phraseInvites.entries()) {
+    if (!record || typeof record.expiresAtMs !== "number" || record.expiresAtMs <= nowMs) {
+      phraseInvites.delete(phraseSlug);
+    }
+  }
+}
+
+function generateShortCode(length) {
+  const bytes = randomBytes(length);
+  let out = "";
+  for (let i = 0; i < length; i += 1) {
+    out += SHORT_INVITE_ALPHABET[bytes[i] % SHORT_INVITE_ALPHABET.length];
+  }
+  return out;
+}
+
+function issueShortInvite(inviteToken, expiresAtIso) {
+  const expiresAtMs = Date.parse(expiresAtIso);
+  if (!Number.isFinite(expiresAtMs)) {
+    return null;
+  }
+
+  pruneExpiredShortInvites();
+
+  if (shortInvites.size >= SHORT_INVITE_MAX_ACTIVE) {
+    const oldestCode = shortInvites.keys().next().value;
+    if (oldestCode) {
+      shortInvites.delete(oldestCode);
+    }
+  }
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const code = generateShortCode(SHORT_INVITE_CODE_LENGTH);
+    if (!shortInvites.has(code)) {
+      shortInvites.set(code, {
+        token: inviteToken,
+        expiresAtMs,
+      });
+      return code;
+    }
+  }
+
+  return null;
+}
+
+function generatePhraseSlug(wordCount) {
+  const bytes = randomBytes(wordCount * 2);
+  const words = [];
+  for (let i = 0; i < wordCount; i += 1) {
+    const value = (bytes[i * 2] << 8) | bytes[i * 2 + 1];
+    const index = value % WORKER_INVITE_PHRASE_ALPHABET_SIZE;
+    words.push(phraseWordlist[index]);
+  }
+  return words.join("-");
+}
+
+function issuePhraseInvite(inviteToken, expiresAtIso) {
+  const expiresAtMs = Date.parse(expiresAtIso);
+  if (!Number.isFinite(expiresAtMs)) {
+    return null;
+  }
+
+  pruneExpiredShortInvites();
+
+  if (phraseInvites.size >= SHORT_INVITE_MAX_ACTIVE) {
+    const oldestPhrase = phraseInvites.keys().next().value;
+    if (oldestPhrase) {
+      phraseInvites.delete(oldestPhrase);
+    }
+  }
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const phraseSlug = generatePhraseSlug(WORKER_INVITE_PHRASE_WORDS);
+    if (!phraseInvites.has(phraseSlug)) {
+      phraseInvites.set(phraseSlug, {
+        token: inviteToken,
+        expiresAtMs,
+      });
+      return phraseSlug;
+    }
+  }
+
+  return null;
+}
 
 if (TRUST_PROXY) {
   app.set("trust proxy", 1);
@@ -156,6 +260,34 @@ app.get(WORKER_PATH, (_req, res) => {
   res.sendFile(path.join(__dirname, "..", "web", "worker.html"));
 });
 
+app.get(withBasePath("/j/:code"), (req, res) => {
+  pruneExpiredShortInvites();
+  const code = String(req.params.code || "").toLowerCase();
+  const record = shortInvites.get(code);
+  if (!record) {
+    return res.status(404).send("Invite code not found or expired.");
+  }
+  if (record.expiresAtMs <= Date.now()) {
+    shortInvites.delete(code);
+    return res.status(410).send("Invite code expired.");
+  }
+  return res.redirect(`${WORKER_PATH}?invite=${encodeURIComponent(record.token)}`);
+});
+
+app.get(withBasePath("/p/:phraseSlug"), (req, res) => {
+  pruneExpiredShortInvites();
+  const phraseSlug = String(req.params.phraseSlug || "").toLowerCase();
+  const record = phraseInvites.get(phraseSlug);
+  if (!record) {
+    return res.status(404).send("Invite phrase not found or expired.");
+  }
+  if (record.expiresAtMs <= Date.now()) {
+    phraseInvites.delete(phraseSlug);
+    return res.status(410).send("Invite phrase expired.");
+  }
+  return res.redirect(`${WORKER_PATH}?invite=${encodeURIComponent(record.token)}`);
+});
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true, now: new Date().toISOString() });
 });
@@ -185,7 +317,7 @@ app.get(withBasePath("/api/public-config"), (_req, res) => {
   });
 });
 
-app.post(withBasePath("/api/invites/worker"), auth.requireClientAuth, (req, res) => {
+app.post(withBasePath("/api/invites/worker"), auth.requireClientAuth, async (req, res) => {
   const parsed = parseInviteRequestBody(req.body);
   if (!parsed.ok) {
     return res.status(400).json({ error: parsed.error });
@@ -194,10 +326,32 @@ app.post(withBasePath("/api/invites/worker"), auth.requireClientAuth, (req, res)
   const invite = auth.issueWorkerInvite(parsed.value);
   const baseUrl = requestBaseUrl(req);
   const inviteUrl = `${baseUrl}${WORKER_PATH}?invite=${encodeURIComponent(invite.token)}`;
+  const shortCode = issueShortInvite(invite.token, invite.expiresAt);
+  const shortInviteUrl = shortCode ? `${baseUrl}${SHORT_INVITE_PATH}/${shortCode}` : null;
+  const phraseSlug = issuePhraseInvite(invite.token, invite.expiresAt);
+  const phraseInviteUrl = phraseSlug ? `${baseUrl}${PHRASE_INVITE_PATH}/${phraseSlug}` : null;
+  const phraseCode = phraseSlug ? phraseSlug.split("-").join(" ") : null;
+  const qrTargetUrl = phraseInviteUrl || shortInviteUrl || inviteUrl;
+  let inviteQrDataUrl = null;
+  try {
+    inviteQrDataUrl = await QRCode.toDataURL(qrTargetUrl, {
+      errorCorrectionLevel: "M",
+      margin: 1,
+      width: 320,
+    });
+  } catch (error) {
+    console.warn(`[invite] Failed to generate QR image: ${error.message}`);
+  }
 
   return res.status(201).json({
     inviteToken: invite.token,
     inviteUrl,
+    shortCode,
+    shortInviteUrl,
+    phraseSlug,
+    phraseCode,
+    phraseInviteUrl,
+    inviteQrDataUrl,
     expiresAt: invite.expiresAt,
     ttlSec: invite.ttlSec,
   });
@@ -406,6 +560,8 @@ server.listen(PORT, HOST, () => {
   console.log(`Cluster server running at http://${HOST}:${PORT}`);
   console.log(`Client UI: http://localhost:${PORT}${CLIENT_PATH}`);
   console.log(`Worker UI: http://localhost:${PORT}${WORKER_PATH}`);
+  console.log(`Short Invite Path: ${SHORT_INVITE_PATH}/<code>`);
+  console.log(`Phrase Invite Path: ${PHRASE_INVITE_PATH}/<word>-<word>-<word>-<word>`);
   if (BASE_PATH) {
     console.log(`[config] BASE_PATH=${BASE_PATH}`);
   }

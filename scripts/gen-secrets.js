@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 
 const { generateKeyPairSync, randomBytes } = require("node:crypto");
+const { tokenToMnemonic } = require("../common/client-key");
 
 function makeToken(bytes = 32) {
   return randomBytes(bytes).toString("base64url");
 }
 
-console.log("CLIENT_API_KEY=" + makeToken(32));
+const clientApiKey = makeToken(32);
+console.log("CLIENT_API_KEY=" + clientApiKey);
+const mnemonic = tokenToMnemonic(clientApiKey);
+if (mnemonic.ok) {
+  console.log("CLIENT_API_KEY_MNEMONIC=" + mnemonic.mnemonic);
+}
 console.log("WORKER_INVITE_SECRET=" + makeToken(48));
 
 const keyPair = generateKeyPairSync("rsa", {

@@ -116,6 +116,24 @@
       #scriptCode {
         min-height: 160px;
       }
+      .qr-panel {
+        display: flex;
+        gap: 0.8rem;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      #inviteQr {
+        display: none;
+        width: 220px;
+        height: 220px;
+        background: #fff;
+        border-radius: 8px;
+        padding: 6px;
+      }
+      #downloadQrLink {
+        display: none;
+        color: var(--text);
+      }
       @media (max-width: 780px) {
         form,
         .row,
@@ -131,7 +149,7 @@
         <h1>Cluster Secure Client</h1>
         <p>Use your client token to submit jobs and generate worker invite links.</p>
         <div class="row">
-          <input id="clientToken" placeholder="Client token (required)" />
+          <input id="clientToken" placeholder="Client token or mnemonic phrase (required)" />
           <button id="saveTokenBtn" class="secondary" type="button">Save Token</button>
         </div>
         <p class="line">Auth status: <strong id="authStatus" class="warn-text">not checked</strong></p>
@@ -144,7 +162,14 @@
           <input id="inviteTtl" type="number" min="60" max="86400" value="3600" placeholder="TTL seconds" />
           <button id="generateInviteBtn" type="button">Generate Invite URL</button>
         </div>
+        <textarea id="phraseCode" class="mono" readonly placeholder="Worker phrase code (type words separated by spaces)"></textarea>
+        <textarea id="phraseInviteUrl" class="mono" readonly placeholder="Worker phrase URL"></textarea>
+        <textarea id="shortInviteUrl" class="mono" readonly placeholder="Short invite URL (easy to type)"></textarea>
         <textarea id="inviteUrl" class="mono" readonly placeholder="Invite URL will appear here"></textarea>
+        <div class="qr-panel">
+          <img id="inviteQr" alt="Worker invite QR code" />
+          <a id="downloadQrLink" class="mono" download="worker-invite-qr.png">Download QR PNG</a>
+        </div>
       </div>
 
       <div class="card stack">
@@ -199,7 +224,12 @@
 
       const inviteTtlEl = document.getElementById("inviteTtl");
       const generateInviteBtn = document.getElementById("generateInviteBtn");
+      const phraseCodeEl = document.getElementById("phraseCode");
+      const phraseInviteUrlEl = document.getElementById("phraseInviteUrl");
+      const shortInviteUrlEl = document.getElementById("shortInviteUrl");
       const inviteUrlEl = document.getElementById("inviteUrl");
+      const inviteQrEl = document.getElementById("inviteQr");
+      const downloadQrLinkEl = document.getElementById("downloadQrLink");
 
       const addJobForm = document.getElementById("addJobForm");
       const inputA = document.getElementById("inputA");
@@ -282,6 +312,24 @@
       function setBusy(isBusy) {
         submitAddBtn.disabled = isBusy;
         submitScriptBtn.disabled = isBusy;
+      }
+
+      function clearInviteQr() {
+        inviteQrEl.src = "";
+        inviteQrEl.style.display = "none";
+        downloadQrLinkEl.href = "";
+        downloadQrLinkEl.style.display = "none";
+      }
+
+      function setInviteQr(dataUrl) {
+        if (!dataUrl) {
+          clearInviteQr();
+          return;
+        }
+        inviteQrEl.src = dataUrl;
+        inviteQrEl.style.display = "block";
+        downloadQrLinkEl.href = dataUrl;
+        downloadQrLinkEl.style.display = "inline-block";
       }
 
       function persistToken() {
@@ -383,7 +431,11 @@
       });
 
       generateInviteBtn.addEventListener("click", async () => {
+        phraseCodeEl.value = "";
+        phraseInviteUrlEl.value = "";
+        shortInviteUrlEl.value = "";
         inviteUrlEl.value = "";
+        clearInviteQr();
         try {
           const ttlSec = Number(inviteTtlEl.value);
           const invite = await apiFetch(withBase("/api/invites/worker"), {
@@ -391,11 +443,22 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ ttlSec }),
           });
+          phraseCodeEl.value = invite.phraseCode || "(phrase unavailable)";
+          phraseInviteUrlEl.value = invite.phraseInviteUrl || "(phrase URL unavailable)";
+          shortInviteUrlEl.value = invite.shortInviteUrl || "(short URL unavailable)";
           inviteUrlEl.value = invite.inviteUrl;
-          if (navigator.clipboard && invite.inviteUrl) {
-            navigator.clipboard.writeText(invite.inviteUrl).catch(() => {});
+          setInviteQr(invite.inviteQrDataUrl);
+          if (navigator.clipboard) {
+            const clipboardUrl = invite.phraseInviteUrl || invite.shortInviteUrl || invite.inviteUrl;
+            if (clipboardUrl) {
+              navigator.clipboard.writeText(clipboardUrl).catch(() => {});
+            }
           }
         } catch (err) {
+          phraseCodeEl.value = "";
+          phraseInviteUrlEl.value = "";
+          shortInviteUrlEl.value = "";
+          clearInviteQr();
           inviteUrlEl.value = `Error: ${err.message}`;
         }
       });

@@ -52,10 +52,13 @@ Options:
   --app-dir DIR                Deployment directory (default: /home/harmonizer/apps/cluster)
   --source-mode MODE           auto|local|remote (default: auto)
   --source-dir DIR             Local repo directory to deploy from (default: script parent dir)
+  --pull-local-source 0|1      Pull latest git changes for local source repo (default: 1)
   --repo-url URL               Git repository URL when source-mode=remote
   --repo-branch BRANCH         Git branch to deploy when source-mode=remote (default: light)
   --proxy-mode MODE            auto|host-nginx|docker-proxy (default: auto)
   --docker-proxy-container N   Optional docker proxy container name override
+  --rotate-client-key 0|1      Rotate CLIENT_API_KEY on each deploy (default: 1)
+  --worker-invite-phrase-words N  Phrase alias word count for workers, 3..8 (default: 8)
   --service-name NAME          systemd service name (default: cluster-app)
   --app-port PORT              Local app port behind nginx (default: 18080)
   --app-host HOST              Bind host for app service (default: 127.0.0.1)
@@ -78,11 +81,14 @@ APP_GROUP=""
 APP_DIR=""
 SOURCE_MODE="auto"
 SOURCE_DIR="${DEFAULT_SOURCE_DIR}"
+PULL_LOCAL_SOURCE="1"
 REPO_URL="https://github.com/asajid2-cell/E-Waste-Reclamation-via-Beowulf-Cluster.git"
 REPO_BRANCH="light"
 PROXY_MODE="auto"
 DOCKER_PROXY_CONTAINER=""
 DOCKER_PROXY_TYPE=""
+ROTATE_CLIENT_KEY="1"
+WORKER_INVITE_PHRASE_WORDS="8"
 SERVICE_NAME="cluster-app"
 APP_PORT="18080"
 APP_HOST="127.0.0.1"
@@ -122,6 +128,10 @@ while [[ $# -gt 0 ]]; do
       SOURCE_DIR="${2:?missing value}"
       shift 2
       ;;
+    --pull-local-source)
+      PULL_LOCAL_SOURCE="${2:?missing value}"
+      shift 2
+      ;;
     --repo-url)
       REPO_URL="${2:?missing value}"
       shift 2
@@ -136,6 +146,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --docker-proxy-container)
       DOCKER_PROXY_CONTAINER="${2:?missing value}"
+      shift 2
+      ;;
+    --rotate-client-key)
+      ROTATE_CLIENT_KEY="${2:?missing value}"
+      shift 2
+      ;;
+    --worker-invite-phrase-words)
+      WORKER_INVITE_PHRASE_WORDS="${2:?missing value}"
       shift 2
       ;;
     --service-name)
@@ -197,8 +215,23 @@ if [[ ! "${SOURCE_MODE}" =~ ^(auto|local|remote)$ ]]; then
   fail "--source-mode must be one of: auto, local, remote"
 fi
 
+if [[ ! "${PULL_LOCAL_SOURCE}" =~ ^(0|1)$ ]]; then
+  fail "--pull-local-source must be 0 or 1"
+fi
+
 if [[ ! "${PROXY_MODE}" =~ ^(auto|host-nginx|docker-proxy)$ ]]; then
   fail "--proxy-mode must be one of: auto, host-nginx, docker-proxy"
+fi
+
+if [[ ! "${ROTATE_CLIENT_KEY}" =~ ^(0|1)$ ]]; then
+  fail "--rotate-client-key must be 0 or 1"
+fi
+
+if ! [[ "${WORKER_INVITE_PHRASE_WORDS}" =~ ^[0-9]+$ ]]; then
+  fail "--worker-invite-phrase-words must be an integer between 3 and 8"
+fi
+if (( WORKER_INVITE_PHRASE_WORDS < 3 || WORKER_INVITE_PHRASE_WORDS > 8 )); then
+  fail "--worker-invite-phrase-words must be between 3 and 8"
 fi
 
 if [[ "${SOURCE_MODE}" == "auto" ]]; then
@@ -255,13 +288,23 @@ cleanup_legacy_nginx_artifacts() {
     cleaned="1"
   done < <(grep -RIl "include /etc/nginx/snippets/cluster-app.conf;" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null || true)
 
+  # Remove transient cluster-route snippet references from manual recovery attempts.
+  while IFS= read -r conf_file; do
+    sed -i '\|include /etc/nginx/snippets/cluster-route.conf;|d' "${conf_file}"
+    cleaned="1"
+  done < <(grep -RIl "include /etc/nginx/snippets/cluster-route.conf;" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null || true)
+
   if [[ -f /etc/nginx/snippets/cluster-app.conf ]]; then
     rm -f /etc/nginx/snippets/cluster-app.conf
     cleaned="1"
   fi
+  if [[ -f /etc/nginx/snippets/cluster-route.conf ]]; then
+    rm -f /etc/nginx/snippets/cluster-route.conf
+    cleaned="1"
+  fi
 
   if [[ "${cleaned}" == "1" ]]; then
-    mark_note "Cleaned legacy nginx artifacts (.bak files and old cluster-app snippet includes)."
+    mark_note "Cleaned legacy nginx artifacts (.bak files and stale cluster snippet includes)."
   fi
 }
 
@@ -272,37 +315,39 @@ validate_signing_keypair() {
   if [[ -z "${private_b64}" || -z "${public_b64}" ]]; then
     return 1
   fi
+  # Validate in Node using the exact formats the app requires (pkcs8/spki DER).
+  PRIV_B64="${private_b64}" PUB_B64="${public_b64}" node - <<'NODE'
+const { createPrivateKey, createPublicKey, createSign, createVerify, randomUUID } = require("node:crypto");
 
-  local tmp_priv
-  local tmp_pub
-  local tmp_derived
-  tmp_priv="$(mktemp)"
-  tmp_pub="$(mktemp)"
-  tmp_derived="$(mktemp)"
+const privB64 = process.env.PRIV_B64 || "";
+const pubB64 = process.env.PUB_B64 || "";
 
-  if ! printf '%s' "${private_b64}" | base64 -d >"${tmp_priv}" 2>/dev/null; then
-    rm -f "${tmp_priv}" "${tmp_pub}" "${tmp_derived}"
-    return 1
-  fi
-  if ! printf '%s' "${public_b64}" | base64 -d >"${tmp_pub}" 2>/dev/null; then
-    rm -f "${tmp_priv}" "${tmp_pub}" "${tmp_derived}"
-    return 1
-  fi
-  if ! openssl pkey -inform DER -in "${tmp_priv}" -pubout -outform DER -out "${tmp_derived}" >/dev/null 2>&1; then
-    rm -f "${tmp_priv}" "${tmp_pub}" "${tmp_derived}"
-    return 1
-  fi
+try {
+  const privateKey = createPrivateKey({
+    key: Buffer.from(privB64, "base64"),
+    type: "pkcs8",
+    format: "der",
+  });
+  const publicKey = createPublicKey({
+    key: Buffer.from(pubB64, "base64"),
+    type: "spki",
+    format: "der",
+  });
 
-  local ok="1"
-  if ! cmp -s "${tmp_pub}" "${tmp_derived}"; then
-    ok="0"
-  fi
-  rm -f "${tmp_priv}" "${tmp_pub}" "${tmp_derived}"
+  const payload = `cluster-setup-key-check-${randomUUID()}`;
+  const signer = createSign("RSA-SHA256");
+  signer.update(payload);
+  signer.end();
+  const sig = signer.sign(privateKey);
 
-  if [[ "${ok}" == "1" ]]; then
-    return 0
-  fi
-  return 1
+  const verifier = createVerify("RSA-SHA256");
+  verifier.update(payload);
+  verifier.end();
+  process.exit(verifier.verify(publicKey, sig) ? 0 : 1);
+} catch (_error) {
+  process.exit(1);
+}
+NODE
 }
 
 generate_signing_keypair_node() {
@@ -313,11 +358,133 @@ detect_host_nginx_site_conf() {
   local domain_regex
   domain_regex="$(escape_regex "${DOMAIN}")"
   local nginx_candidates=()
-  mapfile -t nginx_candidates < <(grep -RlsE "server_name[[:space:]].*${domain_regex}" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null || true)
+  mapfile -t nginx_candidates < <(grep -RlsE "server_name[[:space:]].*${domain_regex}" /etc/nginx/sites-available /etc/nginx/sites-enabled 2>/dev/null || true)
   if [[ "${#nginx_candidates[@]}" -eq 0 ]]; then
     return 1
   fi
-  printf '%s' "${nginx_candidates[0]}"
+
+  # Filter backup artifacts and prefer canonical files in sites-available.
+  local filtered=()
+  local candidate
+  for candidate in "${nginx_candidates[@]}"; do
+    case "${candidate}" in
+      *.bak*|*.disabled.*)
+        continue
+        ;;
+    esac
+    if [[ -e "${candidate}" ]]; then
+      filtered+=("$(realpath "${candidate}")")
+    fi
+  done
+
+  if [[ "${#filtered[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  local unique=()
+  local seen=""
+  for candidate in "${filtered[@]}"; do
+    if [[ "|${seen}|" != *"|${candidate}|"* ]]; then
+      unique+=("${candidate}")
+      seen="${seen}|${candidate}"
+    fi
+  done
+
+  for candidate in "${unique[@]}"; do
+    if [[ "${candidate}" == /etc/nginx/sites-available/* ]]; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+
+  printf '%s' "${unique[0]}"
+}
+
+ensure_nginx_include_in_domain_servers() {
+  local nginx_conf_path="$1"
+  local include_line="$2"
+  DOMAIN="${DOMAIN}" BASE_PATH="${BASE_PATH}" INCLUDE_LINE="${include_line}" NGINX_CONF_PATH="${nginx_conf_path}" python3 - <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(os.environ["NGINX_CONF_PATH"])
+domain = os.environ["DOMAIN"]
+base_path = os.environ["BASE_PATH"]
+include_stmt = os.environ["INCLUDE_LINE"].strip()
+
+if not path.exists():
+    print(f"Nginx conf not found: {path}", file=sys.stderr)
+    sys.exit(2)
+
+lines = path.read_text(encoding="utf-8").splitlines()
+original_lines = list(lines)
+domain_rx = re.compile(re.escape(domain))
+server_open_rx = re.compile(r"^\s*server\s*\{")
+server_name_rx = re.compile(r"^\s*server_name\b")
+location_exact_rx = re.compile(rf"^\s*location\s*=\s*{re.escape(base_path)}\s*\{{")
+location_prefix_rx = re.compile(rf"^\s*location\s+\^~\s+{re.escape(base_path)}/\s*\{{")
+
+blocks = []
+i = 0
+while i < len(lines):
+    if server_open_rx.search(lines[i]):
+        depth = lines[i].count("{") - lines[i].count("}")
+        j = i + 1
+        while j < len(lines):
+            depth += lines[j].count("{")
+            depth -= lines[j].count("}")
+            if depth == 0:
+                blocks.append((i, j))
+                break
+            j += 1
+        i = j
+    i += 1
+
+changed = False
+matched = 0
+
+for start, end in reversed(blocks):
+    block = lines[start:end + 1]
+    domain_hit = any(server_name_rx.search(ln) and domain_rx.search(ln) for ln in block)
+    if not domain_hit:
+        continue
+    matched += 1
+
+    has_inline_cluster_locations = any(location_exact_rx.search(ln) or location_prefix_rx.search(ln) for ln in block)
+
+    new_block = [ln for ln in block if include_stmt not in ln]
+    if len(new_block) != len(block):
+        changed = True
+
+    if not has_inline_cluster_locations:
+        insert_after = None
+        for idx, ln in enumerate(new_block):
+            if server_name_rx.search(ln) and domain_rx.search(ln):
+                insert_after = idx
+        if insert_after is None:
+            insert_after = 0
+
+        indent = "    "
+        if 0 <= insert_after < len(new_block):
+            m = re.match(r"^(\s*)", new_block[insert_after])
+            indent = m.group(1) if m else indent
+        include_line = f"{indent}{include_stmt}"
+        new_block.insert(insert_after + 1, include_line)
+        changed = True
+
+    lines[start:end + 1] = new_block
+
+if matched == 0:
+    print(f"No server block with server_name containing '{domain}' found in {path}", file=sys.stderr)
+    sys.exit(3)
+
+if changed:
+    backup = pathlib.Path("/tmp") / f"{path.name}.cluster-setup.{os.getpid()}.bak"
+    backup.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
 }
 
 infer_proxy_type_from_image() {
@@ -528,7 +695,7 @@ insert = [
 ]
 
 out = lines[:start + 1] + insert + lines[start + 1:]
-backup = path.with_suffix(path.suffix + ".bak")
+backup = pathlib.Path("/tmp") / f"{path.name}.cluster-setup.{os.getpid()}.bak"
 backup.write_text("\n".join(lines) + "\n", encoding="utf-8")
 path.write_text("\n".join(out) + "\n", encoding="utf-8")
 PY
@@ -608,7 +775,7 @@ insert = [
 ]
 
 out = lines[:server_end] + insert + [lines[server_end]] + lines[server_end + 1:]
-backup = path.with_suffix(path.suffix + ".bak")
+backup = pathlib.Path("/tmp") / f"{path.name}.cluster-setup.{os.getpid()}.bak"
 backup.write_text("\n".join(lines) + "\n", encoding="utf-8")
 path.write_text("\n".join(out) + "\n", encoding="utf-8")
 PY
@@ -731,6 +898,17 @@ install -d -o "${APP_USER}" -g "${APP_GROUP}" "$(dirname "${APP_DIR}")"
 install -d -o "${APP_USER}" -g "${APP_GROUP}" "${APP_DIR}"
 
 if [[ "${SOURCE_MODE}" == "local" ]]; then
+  if [[ "${PULL_LOCAL_SOURCE}" == "1" && -d "${SOURCE_DIR}/.git" ]]; then
+    log "Pulling latest changes in local source repo ${SOURCE_DIR}"
+    if run_as_app "cd '${SOURCE_DIR}' && git pull --ff-only"; then
+      mark_done "Pulled latest local source updates in ${SOURCE_DIR}."
+    elif git -C "${SOURCE_DIR}" pull --ff-only >/dev/null 2>&1; then
+      mark_done "Pulled latest local source updates in ${SOURCE_DIR} (root fallback)."
+    else
+      mark_pending "Could not pull local source automatically in ${SOURCE_DIR}; continuing with current files."
+    fi
+  fi
+
   log "Syncing local source ${SOURCE_DIR} into ${APP_DIR}"
   source_real="$(realpath "${SOURCE_DIR}")"
   app_real="$(realpath "${APP_DIR}")"
@@ -803,8 +981,12 @@ client_api_key="$(get_env_value CLIENT_API_KEY || true)"
 worker_invite_secret="$(get_env_value WORKER_INVITE_SECRET || true)"
 job_signing_private_key_b64="$(get_env_value JOB_SIGNING_PRIVATE_KEY_B64 || true)"
 job_signing_public_key_b64="$(get_env_value JOB_SIGNING_PUBLIC_KEY_B64 || true)"
+client_api_key_mnemonic=""
 
-if is_missing_secret "${client_api_key}"; then
+if [[ "${ROTATE_CLIENT_KEY}" == "1" ]]; then
+  client_api_key="$(openssl rand -hex 32)"
+  mark_done "Rotated CLIENT_API_KEY for this deployment."
+elif is_missing_secret "${client_api_key}"; then
   client_api_key="$(openssl rand -hex 32)"
 fi
 if is_missing_secret "${worker_invite_secret}"; then
@@ -833,12 +1015,14 @@ set_env_key "TRUST_PROXY" "1"
 set_env_key "BASE_PATH" "${BASE_PATH}"
 set_env_key "CLIENT_API_KEY" "${client_api_key}"
 set_env_key "WORKER_INVITE_SECRET" "${worker_invite_secret}"
+set_env_key "WORKER_INVITE_PHRASE_WORDS" "${WORKER_INVITE_PHRASE_WORDS}"
 set_env_key "JOB_SIGNING_PRIVATE_KEY_B64" "${job_signing_private_key_b64}"
 set_env_key "JOB_SIGNING_PUBLIC_KEY_B64" "${job_signing_public_key_b64}"
 
 chown "${APP_USER}:${APP_GROUP}" "${ENV_FILE}"
 chmod 600 "${ENV_FILE}"
 mark_done "Configured app environment keys and secure permissions on ${ENV_FILE}."
+mark_note "Mnemonic helper: run 'cd ${APP_DIR} && node cli/cluster-cli.js token-mnemonic --env-file ${ENV_FILE}' to get an easier client auth phrase."
 
 if [[ "${SKIP_VENV}" == "0" ]]; then
   log "Creating/updating python virtualenv at ${VENV_PATH}"
@@ -858,6 +1042,13 @@ fi
 log "Installing production node dependencies"
 run_as_app "cd '${APP_DIR}' && npm ci --omit=dev"
 mark_done "Installed npm production dependencies."
+
+client_api_key_mnemonic="$(run_as_app "cd '${APP_DIR}' && CLIENT_KEY='${client_api_key}' node -e \"const {tokenToMnemonic}=require('./common/client-key'); const r=tokenToMnemonic(process.env.CLIENT_KEY||''); if(!r.ok){process.exit(1);} console.log(r.mnemonic);\"" 2>/dev/null || true)"
+if [[ -n "${client_api_key_mnemonic}" ]]; then
+  mark_done "Generated mnemonic phrase for CLIENT_API_KEY."
+else
+  mark_pending "Could not generate mnemonic phrase for CLIENT_API_KEY automatically."
+fi
 
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 log "Writing systemd service ${SERVICE_NAME}"
@@ -978,15 +1169,9 @@ EOF
     mark_done "Wrote nginx snippet ${NGINX_SNIPPET}."
 
     include_line="include ${NGINX_SNIPPET};"
-    if ! grep -Fq "${include_line}" "${NGINX_SITE_CONF}"; then
-      log "Injecting nginx include into ${NGINX_SITE_CONF}"
-      cp "${NGINX_SITE_CONF}" "${NGINX_SITE_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-      domain_regex="$(escape_regex "${DOMAIN}")"
-      sed -i "/server_name[[:space:]].*${domain_regex}/a\\    ${include_line}" "${NGINX_SITE_CONF}"
-      mark_done "Injected nginx include into ${NGINX_SITE_CONF}."
-    else
-      mark_done "Nginx include already present in ${NGINX_SITE_CONF}."
-    fi
+    log "Ensuring nginx include is present in domain server blocks in ${NGINX_SITE_CONF}"
+    ensure_nginx_include_in_domain_servers "${NGINX_SITE_CONF}" "${include_line}"
+    mark_done "Ensured nginx include is configured for ${DOMAIN} server blocks in ${NGINX_SITE_CONF}."
   fi
 
   log "Testing and reloading nginx"
@@ -1057,7 +1242,10 @@ REPORT_FILE="${APP_DIR}/deploy-status.txt"
   echo "App Dir: ${APP_DIR}"
   echo "Service: ${SERVICE_NAME}"
   echo "Source Mode: ${SOURCE_MODE}"
+  echo "Pull Local Source: ${PULL_LOCAL_SOURCE}"
   echo "Proxy Mode: ${effective_proxy_mode}"
+  echo "Rotate Client Key: ${ROTATE_CLIENT_KEY}"
+  echo "Worker Invite Phrase Words: ${WORKER_INVITE_PHRASE_WORDS}"
   if [[ -n "${DOCKER_PROXY_CONTAINER}" ]]; then
     echo "Docker Proxy Container: ${DOCKER_PROXY_CONTAINER}"
     echo "Docker Proxy Type: ${DOCKER_PROXY_TYPE}"
@@ -1092,3 +1280,7 @@ chown "${APP_USER}:${APP_GROUP}" "${REPORT_FILE}" || true
 log "Setup complete."
 log "Status report saved to ${REPORT_FILE}"
 log "Client API token is stored in ${ENV_FILE}"
+log "CLIENT_API_KEY (new/current): ${client_api_key}"
+if [[ -n "${client_api_key_mnemonic}" ]]; then
+  log "CLIENT_API_KEY mnemonic: ${client_api_key_mnemonic}"
+fi

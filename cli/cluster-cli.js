@@ -2,6 +2,8 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const QRCode = require("qrcode");
+const { mnemonicToToken, tokenToMnemonic } = require("../common/client-key");
 
 const DEFAULT_HOST = "http://127.0.0.1:8080";
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -11,7 +13,11 @@ function printUsage() {
   console.log("Usage:");
   console.log("  node cli/cluster-cli.js submit --a <int> --b <int> [--host <url>] [--client-token <token>] [--timeout-ms <ms>]");
   console.log("  node cli/cluster-cli.js run-js (--file <path> | --code <js>) [--args-json <json>] [--run-timeout-ms <ms>] [--timeout-ms <ms>] [--host <url>] [--client-token <token>]");
-  console.log("  node cli/cluster-cli.js invite [--host <url>] [--client-token <token>] [--ttl-sec <seconds>] [--label <name>]");
+  console.log(
+    "  node cli/cluster-cli.js invite [--host <url>] [--client-token <token>] [--ttl-sec <seconds>] [--label <name>] [--qr] [--qr-file <path>]",
+  );
+  console.log("  node cli/cluster-cli.js token-mnemonic [--token <key>] [--env-file <.env path>]");
+  console.log("  node cli/cluster-cli.js mnemonic-token --phrase \"<words>\" [--format base64url|hex]");
 }
 
 function parseArgs(argv) {
@@ -59,6 +65,25 @@ function resolveClientToken(flags) {
     throw new Error("Missing client token. Provide --client-token or set CLIENT_API_KEY env var.");
   }
   return token;
+}
+
+function getEnvFileValue(filePath, key) {
+  const absolutePath = path.resolve(filePath);
+  const content = fs.readFileSync(absolutePath, "utf8");
+  for (const line of content.split(/\r?\n/)) {
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+    const idx = line.indexOf("=");
+    if (idx <= 0) {
+      continue;
+    }
+    const currentKey = line.slice(0, idx).trim();
+    if (currentKey === key) {
+      return line.slice(idx + 1).trim();
+    }
+  }
+  return "";
 }
 
 function normalizeHost(rawHost) {
@@ -242,8 +267,71 @@ async function runInvite(flags) {
   });
 
   console.log(`Invite URL: ${invite.inviteUrl}`);
+  if (invite.phraseCode) {
+    console.log(`Worker Phrase: ${invite.phraseCode}`);
+  }
+  if (invite.phraseInviteUrl) {
+    console.log(`Phrase Invite URL: ${invite.phraseInviteUrl}`);
+  }
+  if (invite.shortInviteUrl) {
+    console.log(`Short Invite URL: ${invite.shortInviteUrl}`);
+  }
   console.log(`Expires At: ${invite.expiresAt}`);
   console.log(`TTL Seconds: ${invite.ttlSec}`);
+  const qrTargetUrl = invite.phraseInviteUrl || invite.shortInviteUrl || invite.inviteUrl;
+
+  if (flags.qr) {
+    const terminalQr = await QRCode.toString(qrTargetUrl, { type: "terminal", small: true });
+    console.log(terminalQr);
+  }
+
+  if (flags["qr-file"] !== undefined) {
+    const qrFilePath = path.resolve(String(flags["qr-file"]));
+    await QRCode.toFile(qrFilePath, qrTargetUrl, {
+      errorCorrectionLevel: "M",
+      margin: 1,
+      width: 512,
+    });
+    console.log(`QR PNG: ${qrFilePath}`);
+  }
+
+  return 0;
+}
+
+async function runTokenMnemonic(flags) {
+  let token = "";
+  if (flags.token !== undefined) {
+    token = String(flags.token).trim();
+  } else if (flags["env-file"] !== undefined) {
+    token = getEnvFileValue(String(flags["env-file"]), "CLIENT_API_KEY");
+  } else {
+    token = String(flags["client-token"] || process.env.CLIENT_API_KEY || "").trim();
+  }
+
+  if (!token) {
+    throw new Error("Missing token. Use --token, --env-file, --client-token, or CLIENT_API_KEY.");
+  }
+
+  const converted = tokenToMnemonic(token);
+  if (!converted.ok) {
+    throw new Error(`Could not convert token to mnemonic: ${converted.error}`);
+  }
+
+  console.log(`Mnemonic: ${converted.mnemonic}`);
+  return 0;
+}
+
+async function runMnemonicToken(flags) {
+  const phrase = String(flags.phrase || "").trim();
+  if (!phrase) {
+    throw new Error("Missing required flag --phrase");
+  }
+  const format = String(flags.format || "base64url").trim().toLowerCase();
+  const converted = mnemonicToToken(phrase, format);
+  if (!converted.ok) {
+    throw new Error(`Could not convert mnemonic to token: ${converted.error}`);
+  }
+  console.log(`Token (${format}): ${converted.token}`);
   return 0;
 }
 
@@ -268,6 +356,16 @@ async function main() {
 
     if (command === "invite") {
       process.exitCode = await runInvite(flags);
+      return;
+    }
+
+    if (command === "token-mnemonic") {
+      process.exitCode = await runTokenMnemonic(flags);
+      return;
+    }
+
+    if (command === "mnemonic-token") {
+      process.exitCode = await runMnemonicToken(flags);
       return;
     }
 

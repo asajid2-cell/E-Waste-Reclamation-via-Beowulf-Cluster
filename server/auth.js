@@ -9,6 +9,7 @@ const {
   randomUUID,
   timingSafeEqual,
 } = require("node:crypto");
+const { mnemonicToBytes, tokenToBytes } = require("../common/client-key");
 
 const DEFAULT_INVITE_TTL_SEC = 3600;
 const MIN_INVITE_TTL_SEC = 60;
@@ -50,6 +51,16 @@ function safeEqualText(a, b) {
     return false;
   }
   return timingSafeEqual(bufA, bufB);
+}
+
+function safeEqualBuffer(a, b) {
+  if (!Buffer.isBuffer(a) || !Buffer.isBuffer(b)) {
+    return false;
+  }
+  if (a.length !== b.length) {
+    return false;
+  }
+  return timingSafeEqual(a, b);
 }
 
 function buildSigner(secret) {
@@ -241,6 +252,7 @@ function extractClientToken(req) {
 
 function createAuth(config) {
   const sign = buildSigner(config.workerInviteSecret);
+  const configuredClientKeyBytes = tokenToBytes(config.clientApiKey);
 
   function signWorkerAssignment(job) {
     if (!job || !job.task || job.task.op !== "run_js") {
@@ -274,10 +286,18 @@ function createAuth(config) {
 
   function requireClientAuth(req, res, next) {
     const token = extractClientToken(req);
-    if (!safeEqualText(token, config.clientApiKey)) {
-      return res.status(401).json({ error: "Unauthorized client token." });
+    if (safeEqualText(token, config.clientApiKey)) {
+      return next();
     }
-    return next();
+
+    if (configuredClientKeyBytes) {
+      const providedBytes = tokenToBytes(token) || mnemonicToBytes(token);
+      if (providedBytes && safeEqualBuffer(providedBytes, configuredClientKeyBytes)) {
+        return next();
+      }
+    }
+
+    return res.status(401).json({ error: "Unauthorized client token." });
   }
 
   function issueWorkerInvite({ ttlSec, workerLabel } = {}) {

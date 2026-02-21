@@ -49,11 +49,23 @@ All protected `/api/*` routes require:
 
 `Authorization: Bearer <CLIENT_API_KEY>`
 
+You can also authenticate with a mnemonic phrase that represents the same key bytes.
+
 ### Worker auth
 
 Workers must connect using a signed invite token:
 
 `/worker?invite=<token>`
+
+For easier manual typing, invite links can also be shortened:
+
+`/j/<short_code>`
+
+Or generated as easy word phrases:
+
+`/p/<word>-<word>-<word>-<word>`
+
+Short/phrase invite aliases are stored in memory for MVP and reset on server restart.
 
 Invite tokens are HMAC-signed by `WORKER_INVITE_SECRET` and expire by TTL.
 
@@ -94,17 +106,34 @@ node cli/cluster-cli.js run-js --code "return (args.a||0)+(args.b||0)" --args-js
 node cli/cluster-cli.js invite --host https://harmonizer.cc/cluster --client-token <CLIENT_API_KEY> --ttl-sec 3600
 ```
 
+CLI prints full, phrase, and short invite URLs (phrase is preferred for manual typing with stronger entropy).
+
+Optional QR output:
+
+```bash
+node cli/cluster-cli.js invite --host https://harmonizer.cc/cluster --client-token <CLIENT_API_KEY> --qr
+node cli/cluster-cli.js invite --host https://harmonizer.cc/cluster --client-token <CLIENT_API_KEY> --qr-file ./worker-invite.png
+```
+
 You can set `CLIENT_API_KEY` env var and omit `--client-token`.
+
+### Convert client token <-> mnemonic
+
+```bash
+node cli/cluster-cli.js token-mnemonic --token <CLIENT_API_KEY>
+node cli/cluster-cli.js token-mnemonic --env-file ./.env
+node cli/cluster-cli.js mnemonic-token --phrase "word1 word2 ... word24" --format base64url
+```
 
 ## 4. Web Usage
 
 ### Client page
 
 - `https://harmonizer.cc/cluster/client`
-- Enter client token
+- Enter client token or mnemonic phrase
 - Submit `a + b` jobs
 - Submit custom JS jobs (`code + args + timeout`)
-- Generate worker invite URLs
+- Generate phrase + short + full worker invite URLs with QR code preview/download (QR/clipboard prefer phrase URL)
 
 ### Worker page
 
@@ -124,7 +153,9 @@ What it does:
 
 - installs required packages (`nginx`, `nodejs`, `ufw`, optional `fail2ban`)
 - deploys from your local clone by default (`--source-mode auto` resolves to local)
+- pulls latest local git changes by default when deploying from a local repo (`--pull-local-source 1`)
 - writes app `.env` with generated secrets and RSA signing keys if missing
+- rotates `CLIENT_API_KEY` by default and prints both key + mnemonic at the end (`--rotate-client-key 1`)
 - creates a Python virtualenv (`APP_DIR/.venv`) and upgrades pip tooling
 - installs production dependencies (`npm ci --omit=dev`)
 - creates and enables `systemd` service (`cluster-app`)
@@ -140,7 +171,10 @@ Useful flags:
 sudo bash deploy/setup_harmonizer_cluster_vps.sh \
   --source-mode local \
   --source-dir /root/your-clone \
+  --pull-local-source 1 \
   --proxy-mode auto \
+  --rotate-client-key 1 \
+  --worker-invite-phrase-words 8 \
   --domain harmonizer.cc \
   --base-path /cluster
 ```
@@ -188,6 +222,12 @@ Custom job tuning:
 - `CUSTOM_JOB_MAX_TIMEOUT_MS`
 - `CUSTOM_JOB_DEFAULT_TIMEOUT_MS`
 
+Short invite tuning:
+
+- `SHORT_INVITE_CODE_LENGTH` (default `7`, min `4`, max `16`)
+- `SHORT_INVITE_MAX_ACTIVE` (default `50000`)
+- `WORKER_INVITE_PHRASE_WORDS` (default `8`, min `3`, max `8`)
+
 ## 8. Key Endpoints
 
 When `BASE_PATH` is set (for example `/cluster`), prefix all endpoints with it.
@@ -195,6 +235,8 @@ When `BASE_PATH` is set (for example `/cluster`), prefix all endpoints with it.
 - `GET /health`
 - `GET /client`
 - `GET /worker`
+- `GET /j/:code` (short invite redirect)
+- `GET /p/:phraseSlug` (phrase invite redirect)
 - `GET /api/public-config`
 - `GET /api/auth/check` (token required)
 - `POST /api/invites/worker` (token required)
