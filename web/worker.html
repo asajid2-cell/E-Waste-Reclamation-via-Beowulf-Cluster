@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -65,7 +65,7 @@
         background: #0e1e35;
         border-radius: 8px;
         padding: 0.75rem;
-        max-height: 260px;
+        max-height: 280px;
         overflow-y: auto;
         color: var(--muted);
       }
@@ -94,6 +94,7 @@
     <script>
       const WORKER_ID_KEY = "cluster_worker_id";
       const MAX_RECONNECT_MS = 10_000;
+      const MAX_CLOCK_SKEW_MS = 30_000;
       const BASE_PATH = (() => {
         const path = window.location.pathname.replace(/\/+$/, "");
         if (path.endsWith("/worker")) {
@@ -102,23 +103,32 @@
         return "";
       })();
 
+      const EXECUTOR_SOURCE = `
+self.onmessage = async (event) => {
+  const payload = event.data || {};
+  const code = typeof payload.code === "string" ? payload.code : "";
+  const args = payload.args;
+  try {
+    const fn = new Function("args", '"use strict";\\n' + code);
+    const rawResult = await fn(args);
+    let normalized = null;
+    try {
+      const resultJson = JSON.stringify(rawResult);
+      normalized = resultJson === undefined ? null : JSON.parse(resultJson);
+    } catch (_resultError) {
+      throw new Error("Result is not JSON-serializable");
+    }
+    self.postMessage({ ok: true, result: normalized });
+  } catch (error) {
+    const message = error && error.message ? error.message : "Execution failed";
+    self.postMessage({ ok: false, error: message });
+  }
+};
+`;
+
       function withBase(path) {
         return `${BASE_PATH}${path}`;
       }
-
-      const connStateEl = document.getElementById("connState");
-      const workerIdEl = document.getElementById("workerId");
-      const currentJobEl = document.getElementById("currentJob");
-      const inviteStateEl = document.getElementById("inviteState");
-      const inviteErrorEl = document.getElementById("inviteError");
-      const logEl = document.getElementById("log");
-
-      let ws = null;
-      let reconnectDelay = 500;
-      let reconnectTimer = null;
-
-      const inviteToken = new URLSearchParams(window.location.search).get("invite") || "";
-      inviteStateEl.textContent = inviteToken ? "present" : "missing";
 
       function randomSuffix() {
         return Math.random().toString(36).slice(2, 8);
@@ -133,8 +143,41 @@
         return workerId;
       }
 
+      function base64ToBytes(base64) {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
+      }
+
+      function base64UrlToBytes(base64url) {
+        let base64 = String(base64url).replace(/-/g, "+").replace(/_/g, "/");
+        while (base64.length % 4 !== 0) {
+          base64 += "=";
+        }
+        return base64ToBytes(base64);
+      }
+
+      const connStateEl = document.getElementById("connState");
+      const workerIdEl = document.getElementById("workerId");
+      const currentJobEl = document.getElementById("currentJob");
+      const inviteStateEl = document.getElementById("inviteState");
+      const inviteErrorEl = document.getElementById("inviteError");
+      const logEl = document.getElementById("log");
+
       const workerId = getWorkerId();
+      const inviteToken = new URLSearchParams(window.location.search).get("invite") || "";
+      const seenNonces = new Map();
+
+      let ws = null;
+      let reconnectDelay = 500;
+      let reconnectTimer = null;
+      let verifyKeyPromise = null;
+
       workerIdEl.textContent = workerId;
+      inviteStateEl.textContent = inviteToken ? "present" : "missing";
 
       function appendLog(line) {
         const timestamp = new Date().toLocaleTimeString();
@@ -155,45 +198,219 @@
         ws.send(JSON.stringify(message));
       }
 
-      function handleAssignMessage(message) {
-        const { jobId, payload } = message;
-        if (!jobId || !payload || payload.op !== "add" || !Number.isInteger(payload.a) || !Number.isInteger(payload.b)) {
-          appendLog("received malformed assignment");
-          send({ type: "error", workerId, jobId: jobId || "unknown", error: "Malformed assignment payload" });
-          return;
-        }
-
-        currentJobEl.textContent = jobId;
-        appendLog(`processing job ${jobId}: ${payload.a} + ${payload.b}`);
-
-        try {
-          const result = payload.a + payload.b;
-          send({ type: "result", workerId, jobId, result });
-          appendLog(`sent result for ${jobId}: ${result}`);
-          currentJobEl.textContent = "idle";
-          send({ type: "ready", workerId });
-        } catch (error) {
-          send({
-            type: "error",
-            workerId,
-            jobId,
-            error: error && error.message ? error.message : "Computation failure",
-          });
-          appendLog(`error while processing ${jobId}`);
-          currentJobEl.textContent = "idle";
-          send({ type: "ready", workerId });
-        }
-      }
-
       function scheduleReconnect() {
         if (reconnectTimer) {
           clearTimeout(reconnectTimer);
         }
-        reconnectTimer = setTimeout(connect, reconnectDelay);
+        reconnectTimer = setTimeout(() => {
+          connect();
+        }, reconnectDelay);
         reconnectDelay = Math.min(Math.floor(reconnectDelay * 1.8), MAX_RECONNECT_MS);
       }
 
-      function connect() {
+      async function loadVerifyKey() {
+        const response = await fetch(withBase("/api/public-config"), { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`public-config failed (${response.status})`);
+        }
+        const config = await response.json();
+        if (!config || typeof config.jobSigningPublicKeySpkiB64 !== "string" || !config.jobSigningPublicKeySpkiB64) {
+          throw new Error("Missing signing public key.");
+        }
+        const keyData = base64ToBytes(config.jobSigningPublicKeySpkiB64);
+        return crypto.subtle.importKey(
+          "spki",
+          keyData.buffer,
+          {
+            name: "RSASSA-PKCS1-v1_5",
+            hash: "SHA-256",
+          },
+          false,
+          ["verify"],
+        );
+      }
+
+      function ensureVerifyKey() {
+        if (verifyKeyPromise) {
+          return verifyKeyPromise;
+        }
+        verifyKeyPromise = loadVerifyKey().catch((error) => {
+          verifyKeyPromise = null;
+          throw error;
+        });
+        return verifyKeyPromise;
+      }
+
+      function cleanupNonces(nowMs) {
+        for (const [nonce, exp] of seenNonces.entries()) {
+          if (exp < nowMs) {
+            seenNonces.delete(nonce);
+          }
+        }
+      }
+
+      function rememberNonceOrReject(nonce, exp) {
+        const nowMs = Date.now();
+        cleanupNonces(nowMs);
+        if (seenNonces.has(nonce)) {
+          return false;
+        }
+        seenNonces.set(nonce, exp);
+        return true;
+      }
+
+      async function verifySignedTask(jobId, signedTask) {
+        if (!signedTask || typeof signedTask !== "object") {
+          throw new Error("Missing signed task envelope.");
+        }
+        if (signedTask.alg !== "RS256") {
+          throw new Error("Unsupported signature algorithm.");
+        }
+        if (typeof signedTask.payload !== "string" || signedTask.payload.length === 0) {
+          throw new Error("Missing signed payload.");
+        }
+        if (typeof signedTask.signature !== "string" || signedTask.signature.length === 0) {
+          throw new Error("Missing signature.");
+        }
+
+        const verifyKey = await ensureVerifyKey();
+        const payloadBytes = new TextEncoder().encode(signedTask.payload);
+        const signatureBytes = base64UrlToBytes(signedTask.signature);
+        const isValid = await crypto.subtle.verify(
+          { name: "RSASSA-PKCS1-v1_5" },
+          verifyKey,
+          signatureBytes.buffer,
+          payloadBytes,
+        );
+        if (!isValid) {
+          throw new Error("Invalid task signature.");
+        }
+
+        let payload = null;
+        try {
+          payload = JSON.parse(signedTask.payload);
+        } catch (_err) {
+          throw new Error("Signed payload is not valid JSON.");
+        }
+
+        if (!payload || payload.typ !== "cluster_signed_job" || payload.v !== 1) {
+          throw new Error("Signed payload type mismatch.");
+        }
+        if (payload.jobId !== jobId) {
+          throw new Error("Signed payload jobId mismatch.");
+        }
+        if (typeof payload.nonce !== "string" || payload.nonce.length < 8) {
+          throw new Error("Signed payload missing nonce.");
+        }
+        if (!Number.isInteger(payload.iat) || !Number.isInteger(payload.exp)) {
+          throw new Error("Signed payload missing timestamps.");
+        }
+        const nowMs = Date.now();
+        if (payload.exp < nowMs) {
+          throw new Error("Signed payload expired.");
+        }
+        if (payload.iat > nowMs + MAX_CLOCK_SKEW_MS) {
+          throw new Error("Signed payload iat too far in future.");
+        }
+        if (!rememberNonceOrReject(payload.nonce, payload.exp)) {
+          throw new Error("Replay detected for signed payload.");
+        }
+
+        if (!payload.task || payload.task.op !== "run_js" || typeof payload.task.code !== "string") {
+          throw new Error("Signed task payload invalid.");
+        }
+        if (!Number.isInteger(payload.task.timeoutMs) || payload.task.timeoutMs <= 0) {
+          throw new Error("Signed task timeout invalid.");
+        }
+
+        return payload.task;
+      }
+
+      function executeScript(code, args, timeoutMs) {
+        return new Promise((resolve, reject) => {
+          const blob = new Blob([EXECUTOR_SOURCE], { type: "application/javascript" });
+          const runnerUrl = URL.createObjectURL(blob);
+          const runner = new Worker(runnerUrl);
+          const timeout = setTimeout(() => {
+            runner.terminate();
+            URL.revokeObjectURL(runnerUrl);
+            reject(new Error("Execution timeout exceeded"));
+          }, timeoutMs);
+
+          runner.addEventListener("message", (event) => {
+            clearTimeout(timeout);
+            runner.terminate();
+            URL.revokeObjectURL(runnerUrl);
+            const message = event.data || {};
+            if (message.ok) {
+              resolve(message.result);
+              return;
+            }
+            reject(new Error(message.error || "Execution failed"));
+          });
+
+          runner.addEventListener("error", () => {
+            clearTimeout(timeout);
+            runner.terminate();
+            URL.revokeObjectURL(runnerUrl);
+            reject(new Error("Execution worker crashed"));
+          });
+
+          runner.postMessage({ code, args });
+        });
+      }
+
+      async function handleAddAssignment(jobId, payload) {
+        if (!payload || payload.op !== "add" || !Number.isInteger(payload.a) || !Number.isInteger(payload.b)) {
+          send({ type: "error", workerId, jobId: jobId || "unknown", error: "Malformed add payload" });
+          return;
+        }
+
+        currentJobEl.textContent = jobId;
+        appendLog(`processing add job ${jobId}: ${payload.a} + ${payload.b}`);
+        const result = payload.a + payload.b;
+        send({ type: "result", workerId, jobId, result });
+        appendLog(`sent add result for ${jobId}`);
+      }
+
+      async function handleRunJsAssignment(jobId, payload) {
+        currentJobEl.textContent = jobId;
+        appendLog(`verifying signed JS job ${jobId}`);
+
+        const verifiedTask = await verifySignedTask(jobId, payload.signedTask);
+        appendLog(`running signed JS job ${jobId} timeout=${verifiedTask.timeoutMs}ms`);
+
+        const result = await executeScript(verifiedTask.code, verifiedTask.args, verifiedTask.timeoutMs);
+        send({ type: "result", workerId, jobId, result });
+        appendLog(`sent JS result for ${jobId}`);
+      }
+
+      async function handleAssignMessage(message) {
+        const { jobId, payload } = message;
+        if (!jobId || !payload || typeof payload !== "object") {
+          send({ type: "error", workerId, jobId: jobId || "unknown", error: "Malformed assignment payload" });
+          return;
+        }
+
+        try {
+          if (payload.op === "add") {
+            await handleAddAssignment(jobId, payload);
+          } else if (payload.op === "run_js") {
+            await handleRunJsAssignment(jobId, payload);
+          } else {
+            throw new Error("Unsupported task operation.");
+          }
+        } catch (error) {
+          const messageText = error && error.message ? error.message : "Task execution failure";
+          appendLog(`job ${jobId} failed: ${messageText}`);
+          send({ type: "error", workerId, jobId, error: messageText });
+        } finally {
+          currentJobEl.textContent = "idle";
+          send({ type: "ready", workerId });
+        }
+      }
+
+      async function connect() {
         if (!inviteToken) {
           setConnectionState("disconnected");
           inviteErrorEl.textContent = "Missing invite token. Ask the client owner for an invite URL.";
@@ -202,6 +419,15 @@
         }
 
         if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+          return;
+        }
+
+        try {
+          await ensureVerifyKey();
+        } catch (error) {
+          setConnectionState("disconnected");
+          appendLog(`failed to load signing key: ${error.message}`);
+          scheduleReconnect();
           return;
         }
 
@@ -232,7 +458,9 @@
           }
 
           if (message.type === "assign") {
-            handleAssignMessage(message);
+            handleAssignMessage(message).catch((error) => {
+              appendLog(`assignment handler error: ${error.message}`);
+            });
             return;
           }
 

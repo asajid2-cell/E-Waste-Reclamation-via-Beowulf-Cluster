@@ -2,12 +2,17 @@ const { randomUUID } = require("node:crypto");
 
 const MIN_VALUE = -1_000_000_000;
 const MAX_VALUE = 1_000_000_000;
+const DEFAULT_MAX_CUSTOM_RESULT_BYTES = 64 * 1024;
 
 function isValidInputNumber(value) {
   return Number.isInteger(value) && value >= MIN_VALUE && value <= MAX_VALUE;
 }
 
-function createStore() {
+function createStore(options = {}) {
+  const maxCustomResultBytes = Number.isInteger(options.maxCustomResultBytes) && options.maxCustomResultBytes > 0
+    ? options.maxCustomResultBytes
+    : DEFAULT_MAX_CUSTOM_RESULT_BYTES;
+
   const jobs = new Map();
   const queue = [];
   const workers = new Map();
@@ -168,9 +173,32 @@ function createStore() {
       return { ok: false, reason: "unknown_job_or_worker" };
     }
 
+    let normalizedResult = result;
+    if (job.task && job.task.op === "add") {
+      if (!Number.isInteger(result)) {
+        return { ok: false, reason: "invalid_result_for_add" };
+      }
+      normalizedResult = result;
+    } else if (job.task && job.task.op === "run_js") {
+      let resultJson = "";
+      try {
+        resultJson = JSON.stringify(result);
+      } catch (_error) {
+        return { ok: false, reason: "custom_result_not_json" };
+      }
+      if (resultJson === undefined) {
+        return { ok: false, reason: "custom_result_undefined" };
+      }
+      const resultBytes = Buffer.byteLength(resultJson, "utf8");
+      if (resultBytes > maxCustomResultBytes) {
+        return { ok: false, reason: "custom_result_too_large" };
+      }
+      normalizedResult = JSON.parse(resultJson);
+    }
+
     assignments.delete(jobId);
     job.status = "done";
-    job.result = result;
+    job.result = normalizedResult;
     job.error = null;
     job.assignedWorkerId = workerId;
     touchJob(job);
@@ -263,6 +291,7 @@ function createStore() {
     failJob,
     removeWorkerSocket,
     listWorkers,
+    maxCustomResultBytes,
   };
 }
 

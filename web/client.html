@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -23,7 +23,7 @@
         min-height: 100vh;
       }
       .wrap {
-        max-width: 820px;
+        max-width: 860px;
         margin: 2rem auto;
         padding: 1rem;
       }
@@ -54,6 +54,15 @@
       form {
         display: grid;
         grid-template-columns: 1fr 1fr auto;
+        gap: 0.6rem;
+      }
+      .custom-form {
+        display: grid;
+        gap: 0.6rem;
+      }
+      .custom-row {
+        display: grid;
+        grid-template-columns: 1fr 180px auto;
         gap: 0.6rem;
       }
       input,
@@ -102,11 +111,15 @@
       }
       textarea {
         resize: vertical;
-        min-height: 62px;
+        min-height: 70px;
+      }
+      #scriptCode {
+        min-height: 160px;
       }
       @media (max-width: 780px) {
         form,
-        .row {
+        .row,
+        .custom-row {
           grid-template-columns: 1fr;
         }
       }
@@ -136,17 +149,31 @@
 
       <div class="card stack">
         <strong>Submit Job (a + b)</strong>
-        <form id="jobForm">
+        <form id="addJobForm">
           <input id="inputA" name="a" type="number" step="1" required placeholder="a (integer)" />
           <input id="inputB" name="b" type="number" step="1" required placeholder="b (integer)" />
-          <button id="submitBtn" type="submit">Submit</button>
+          <button id="submitAddBtn" type="submit">Submit</button>
         </form>
+      </div>
+
+      <div class="card stack">
+        <strong>Run Your Own JS (Signed)</strong>
+        <div class="custom-form">
+          <input id="scriptFile" type="file" accept=".js,text/javascript" />
+          <textarea id="scriptCode" class="mono" placeholder="Example: return (args.a || 0) + (args.b || 0);"></textarea>
+          <div class="custom-row">
+            <textarea id="scriptArgs" class="mono" placeholder='Args JSON, e.g. {"a":2,"b":2}'>{}</textarea>
+            <input id="scriptTimeoutMs" type="number" min="200" step="100" placeholder="run timeout ms" />
+            <button id="submitScriptBtn" type="button">Run Script</button>
+          </div>
+        </div>
       </div>
 
       <div class="card">
         <p class="line">Job ID: <span class="mono" id="jobId">-</span></p>
+        <p class="line">Task Type: <strong id="taskType">-</strong></p>
         <p class="line">Status: <strong id="status">idle</strong></p>
-        <p class="line">Result: <strong id="result">-</strong></p>
+        <p class="line">Result: <span class="mono" id="result">-</span></p>
         <p class="line">Error: <span id="error">-</span></p>
       </div>
     </div>
@@ -174,10 +201,18 @@
       const generateInviteBtn = document.getElementById("generateInviteBtn");
       const inviteUrlEl = document.getElementById("inviteUrl");
 
-      const form = document.getElementById("jobForm");
+      const addJobForm = document.getElementById("addJobForm");
       const inputA = document.getElementById("inputA");
       const inputB = document.getElementById("inputB");
-      const submitBtn = document.getElementById("submitBtn");
+      const submitAddBtn = document.getElementById("submitAddBtn");
+
+      const scriptFileEl = document.getElementById("scriptFile");
+      const scriptCodeEl = document.getElementById("scriptCode");
+      const scriptArgsEl = document.getElementById("scriptArgs");
+      const scriptTimeoutMsEl = document.getElementById("scriptTimeoutMs");
+      const submitScriptBtn = document.getElementById("submitScriptBtn");
+
+      const taskTypeEl = document.getElementById("taskType");
       const jobIdEl = document.getElementById("jobId");
       const statusEl = document.getElementById("status");
       const resultEl = document.getElementById("result");
@@ -226,8 +261,27 @@
         return data;
       }
 
+      function formatResult(value) {
+        if (value === null || value === undefined) {
+          return "-";
+        }
+        if (typeof value === "string") {
+          return value;
+        }
+        try {
+          return JSON.stringify(value);
+        } catch (_err) {
+          return "[unserializable result]";
+        }
+      }
+
       function setStatus(status) {
         statusEl.textContent = status;
+      }
+
+      function setBusy(isBusy) {
+        submitAddBtn.disabled = isBusy;
+        submitScriptBtn.disabled = isBusy;
       }
 
       function persistToken() {
@@ -271,17 +325,50 @@
         try {
           const data = await apiFetch(withBase(`/api/jobs/${jobId}`));
           setStatus(data.status);
-          resultEl.textContent = data.result == null ? "-" : String(data.result);
+          taskTypeEl.textContent = data.task && data.task.op ? data.task.op : "-";
+          resultEl.textContent = formatResult(data.result);
           errorEl.textContent = data.error == null ? "-" : data.error;
 
           if (data.status === "done" || data.status === "failed") {
             clearInterval(pollTimer);
             pollTimer = null;
-            submitBtn.disabled = false;
+            setBusy(false);
           }
         } catch (err) {
           errorEl.textContent = err.message;
-          submitBtn.disabled = false;
+          setBusy(false);
+        }
+      }
+
+      async function submitAndPoll(path, body) {
+        setBusy(true);
+        errorEl.textContent = "-";
+        resultEl.textContent = "-";
+        taskTypeEl.textContent = "-";
+        setStatus("queued");
+
+        try {
+          const data = await apiFetch(withBase(path), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+
+          currentJobId = data.jobId;
+          jobIdEl.textContent = currentJobId;
+          setStatus(data.status);
+
+          if (pollTimer) {
+            clearInterval(pollTimer);
+          }
+          pollTimer = setInterval(() => {
+            pollJob(currentJobId);
+          }, 800);
+          pollJob(currentJobId);
+        } catch (err) {
+          setStatus("failed");
+          errorEl.textContent = err.message;
+          setBusy(false);
         }
       }
 
@@ -313,39 +400,45 @@
         }
       });
 
-      form.addEventListener("submit", async (event) => {
+      addJobForm.addEventListener("submit", async (event) => {
         event.preventDefault();
-        submitBtn.disabled = true;
-        errorEl.textContent = "-";
-        resultEl.textContent = "-";
-        setStatus("queued");
-
         const a = Number(inputA.value);
         const b = Number(inputB.value);
+        await submitAndPoll("/api/jobs", { a, b });
+      });
 
-        try {
-          const data = await apiFetch(withBase("/api/jobs"), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ a, b }),
-          });
-
-          currentJobId = data.jobId;
-          jobIdEl.textContent = currentJobId;
-          setStatus(data.status);
-
-          if (pollTimer) {
-            clearInterval(pollTimer);
-          }
-          pollTimer = setInterval(() => {
-            pollJob(currentJobId);
-          }, 800);
-          pollJob(currentJobId);
-        } catch (err) {
-          setStatus("failed");
-          errorEl.textContent = err.message;
-          submitBtn.disabled = false;
+      submitScriptBtn.addEventListener("click", async () => {
+        const code = scriptCodeEl.value;
+        if (!code.trim()) {
+          errorEl.textContent = "Script code is required.";
+          return;
         }
+
+        let args = {};
+        try {
+          args = JSON.parse(scriptArgsEl.value || "{}");
+        } catch (_err) {
+          errorEl.textContent = "Args must be valid JSON.";
+          return;
+        }
+
+        const body = { code, args };
+        if (scriptTimeoutMsEl.value.trim()) {
+          body.timeoutMs = Number(scriptTimeoutMsEl.value);
+        }
+        await submitAndPoll("/api/jobs/run-js", body);
+      });
+
+      scriptFileEl.addEventListener("change", () => {
+        const file = scriptFileEl.files && scriptFileEl.files[0];
+        if (!file) {
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+          scriptCodeEl.value = String(reader.result || "");
+        };
+        reader.readAsText(file);
       });
 
       const savedToken = localStorage.getItem(TOKEN_KEY);

@@ -1,8 +1,28 @@
-const { createHmac, randomBytes, randomUUID, timingSafeEqual } = require("node:crypto");
+const {
+  createHmac,
+  createPrivateKey,
+  createPublicKey,
+  createSign,
+  createVerify,
+  generateKeyPairSync,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} = require("node:crypto");
 
 const DEFAULT_INVITE_TTL_SEC = 3600;
 const MIN_INVITE_TTL_SEC = 60;
 const MAX_INVITE_TTL_SEC = 86400;
+const DEFAULT_SIGNED_JOB_TTL_SEC = 120;
+const MIN_SIGNED_JOB_TTL_SEC = 10;
+const MAX_SIGNED_JOB_TTL_SEC = 900;
+
+const DEFAULT_CUSTOM_JOB_MAX_CODE_BYTES = 32 * 1024;
+const DEFAULT_CUSTOM_JOB_MAX_ARGS_BYTES = 32 * 1024;
+const DEFAULT_CUSTOM_JOB_MAX_RESULT_BYTES = 64 * 1024;
+const DEFAULT_CUSTOM_JOB_TIMEOUT_MS = 5000;
+const MIN_CUSTOM_JOB_TIMEOUT_MS = 200;
+const MAX_CUSTOM_JOB_TIMEOUT_MS = 60_000;
 
 function toBase64Url(value) {
   return Buffer.from(value)
@@ -36,6 +56,20 @@ function buildSigner(secret) {
   return (payloadPart) => toBase64Url(createHmac("sha256", secret).update(payloadPart).digest());
 }
 
+function signTextWithRsa(privateKey, text) {
+  const signer = createSign("RSA-SHA256");
+  signer.update(text);
+  signer.end();
+  return toBase64Url(signer.sign(privateKey));
+}
+
+function verifyTextWithRsa(publicKey, text, signature) {
+  const verifier = createVerify("RSA-SHA256");
+  verifier.update(text);
+  verifier.end();
+  return verifier.verify(publicKey, signature);
+}
+
 function parsePositiveInt(value, fallback) {
   const n = Number(value);
   if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
@@ -46,6 +80,67 @@ function parsePositiveInt(value, fallback) {
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
+}
+
+function parseNonNegativeInt(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+    return fallback;
+  }
+  return n;
+}
+
+function decodeBase64(value, name) {
+  try {
+    return Buffer.from(value, "base64");
+  } catch (_error) {
+    throw new Error(`${name} is not valid base64.`);
+  }
+}
+
+function parseSigningKeys({ env, privateKeyB64, publicKeyB64 }) {
+  let resolvedPrivate = privateKeyB64;
+  let resolvedPublic = publicKeyB64;
+
+  if (!resolvedPrivate || !resolvedPublic) {
+    if (env === "production") {
+      throw new Error("JOB_SIGNING_PRIVATE_KEY_B64 and JOB_SIGNING_PUBLIC_KEY_B64 are required in production.");
+    }
+    const generated = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: "spki", format: "der" },
+      privateKeyEncoding: { type: "pkcs8", format: "der" },
+    });
+    resolvedPrivate = generated.privateKey.toString("base64");
+    resolvedPublic = generated.publicKey.toString("base64");
+  }
+
+  const privateKeyDer = decodeBase64(resolvedPrivate, "JOB_SIGNING_PRIVATE_KEY_B64");
+  const publicKeyDer = decodeBase64(resolvedPublic, "JOB_SIGNING_PUBLIC_KEY_B64");
+
+  const privateKey = createPrivateKey({
+    key: privateKeyDer,
+    type: "pkcs8",
+    format: "der",
+  });
+  const publicKey = createPublicKey({
+    key: publicKeyDer,
+    type: "spki",
+    format: "der",
+  });
+
+  const probePayload = `cluster-signing-probe-${randomUUID()}`;
+  const probeSignature = createSign("RSA-SHA256").update(probePayload).end().sign(privateKey);
+  const validPair = verifyTextWithRsa(publicKey, probePayload, probeSignature);
+  if (!validPair) {
+    throw new Error("JOB_SIGNING_PRIVATE_KEY_B64 and JOB_SIGNING_PUBLIC_KEY_B64 do not match.");
+  }
+
+  return {
+    privateKey,
+    publicKey,
+    publicKeySpkiB64: resolvedPublic,
+  };
 }
 
 function resolveConfig() {
@@ -70,11 +165,65 @@ function resolveConfig() {
   const inviteTtlSecRaw = parsePositiveInt(process.env.WORKER_INVITE_TTL_SEC, DEFAULT_INVITE_TTL_SEC);
   const inviteTtlSec = clamp(inviteTtlSecRaw, MIN_INVITE_TTL_SEC, MAX_INVITE_TTL_SEC);
 
+  const signingKeys = parseSigningKeys({
+    env,
+    privateKeyB64: process.env.JOB_SIGNING_PRIVATE_KEY_B64 || "",
+    publicKeyB64: process.env.JOB_SIGNING_PUBLIC_KEY_B64 || "",
+  });
+
+  const signedJobTtlSec = clamp(
+    parsePositiveInt(process.env.SIGNED_JOB_TTL_SEC, DEFAULT_SIGNED_JOB_TTL_SEC),
+    MIN_SIGNED_JOB_TTL_SEC,
+    MAX_SIGNED_JOB_TTL_SEC,
+  );
+
+  const customJobMaxCodeBytes = clamp(
+    parsePositiveInt(process.env.CUSTOM_JOB_MAX_CODE_BYTES, DEFAULT_CUSTOM_JOB_MAX_CODE_BYTES),
+    1024,
+    1024 * 1024,
+  );
+  const customJobMaxArgsBytes = clamp(
+    parsePositiveInt(process.env.CUSTOM_JOB_MAX_ARGS_BYTES, DEFAULT_CUSTOM_JOB_MAX_ARGS_BYTES),
+    1024,
+    1024 * 1024,
+  );
+  const customJobMaxResultBytes = clamp(
+    parsePositiveInt(process.env.CUSTOM_JOB_MAX_RESULT_BYTES, DEFAULT_CUSTOM_JOB_MAX_RESULT_BYTES),
+    1024,
+    1024 * 1024,
+  );
+
+  const customJobMinTimeoutMs = clamp(
+    parsePositiveInt(process.env.CUSTOM_JOB_MIN_TIMEOUT_MS, MIN_CUSTOM_JOB_TIMEOUT_MS),
+    100,
+    MAX_CUSTOM_JOB_TIMEOUT_MS,
+  );
+  const customJobMaxTimeoutMs = clamp(
+    parsePositiveInt(process.env.CUSTOM_JOB_MAX_TIMEOUT_MS, MAX_CUSTOM_JOB_TIMEOUT_MS),
+    customJobMinTimeoutMs,
+    5 * 60_000,
+  );
+  const customJobDefaultTimeoutMs = clamp(
+    parseNonNegativeInt(process.env.CUSTOM_JOB_DEFAULT_TIMEOUT_MS, DEFAULT_CUSTOM_JOB_TIMEOUT_MS),
+    customJobMinTimeoutMs,
+    customJobMaxTimeoutMs,
+  );
+
   return {
     env,
     clientApiKey,
     workerInviteSecret,
     inviteTtlSec,
+    signedJobTtlSec,
+    customJobMaxCodeBytes,
+    customJobMaxArgsBytes,
+    customJobMaxResultBytes,
+    customJobDefaultTimeoutMs,
+    customJobMinTimeoutMs,
+    customJobMaxTimeoutMs,
+    jobSigningPrivateKey: signingKeys.privateKey,
+    jobSigningPublicKey: signingKeys.publicKey,
+    jobSigningPublicKeySpkiB64: signingKeys.publicKeySpkiB64,
   };
 }
 
@@ -92,6 +241,36 @@ function extractClientToken(req) {
 
 function createAuth(config) {
   const sign = buildSigner(config.workerInviteSecret);
+
+  function signWorkerAssignment(job) {
+    if (!job || !job.task || job.task.op !== "run_js") {
+      throw new Error("signWorkerAssignment only supports run_js tasks.");
+    }
+
+    const nowMs = Date.now();
+    const payload = {
+      typ: "cluster_signed_job",
+      v: 1,
+      nonce: randomUUID(),
+      iat: nowMs,
+      exp: nowMs + config.signedJobTtlSec * 1000,
+      jobId: job.jobId,
+      task: {
+        op: "run_js",
+        code: job.task.code,
+        args: job.task.args,
+        timeoutMs: job.task.timeoutMs,
+      },
+    };
+    const payloadText = JSON.stringify(payload);
+    const signature = signTextWithRsa(config.jobSigningPrivateKey, payloadText);
+
+    return {
+      alg: "RS256",
+      payload: payloadText,
+      signature,
+    };
+  }
 
   function requireClientAuth(req, res, next) {
     const token = extractClientToken(req);
@@ -158,6 +337,7 @@ function createAuth(config) {
     requireClientAuth,
     issueWorkerInvite,
     verifyWorkerInvite,
+    signWorkerAssignment,
   };
 }
 
@@ -168,4 +348,7 @@ module.exports = {
   DEFAULT_INVITE_TTL_SEC,
   MIN_INVITE_TTL_SEC,
   MAX_INVITE_TTL_SEC,
+  DEFAULT_SIGNED_JOB_TTL_SEC,
+  MIN_SIGNED_JOB_TTL_SEC,
+  MAX_SIGNED_JOB_TTL_SEC,
 };

@@ -10,7 +10,7 @@ const { WebSocketServer } = require("ws");
 const { createStore, isValidInputNumber, MIN_VALUE, MAX_VALUE } = require("./store");
 const { createDispatcher } = require("./dispatcher");
 const { createAuth, resolveConfig } = require("./auth");
-const { parseInviteRequestBody, parseJobCreateBody, parseWorkerMessage } = require("./validation");
+const { parseInviteRequestBody, parseJobCreateBody, parseRunJsCreateBody, parseWorkerMessage } = require("./validation");
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -18,11 +18,11 @@ const TRUST_PROXY = String(process.env.TRUST_PROXY || "0") === "1";
 const BASE_PATH_RAW = process.env.BASE_PATH || "";
 
 const MAX_INVALID_MESSAGES = 4;
-const WS_MAX_PAYLOAD = Number(process.env.WS_MAX_PAYLOAD || 8 * 1024);
+const WS_MAX_PAYLOAD = Number(process.env.WS_MAX_PAYLOAD || 256 * 1024);
 const WS_MAX_CONNECTIONS_PER_IP = Number(process.env.WS_MAX_CONNECTIONS_PER_IP || 20);
 const WS_MAX_MESSAGES_PER_WINDOW = Number(process.env.WS_MAX_MESSAGES_PER_WINDOW || 120);
 const WS_MESSAGE_WINDOW_MS = Number(process.env.WS_MESSAGE_WINDOW_MS || 10_000);
-const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || "8kb";
+const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || "128kb";
 
 function normalizeBasePath(input) {
   if (!input || input === "/") {
@@ -51,8 +51,10 @@ const config = resolveConfig();
 const auth = createAuth(config);
 
 const app = express();
-const store = createStore();
-const dispatcher = createDispatcher(store, console);
+const store = createStore({
+  maxCustomResultBytes: config.customJobMaxResultBytes,
+});
+const dispatcher = createDispatcher(store, auth, console);
 
 if (TRUST_PROXY) {
   app.set("trust proxy", 1);
@@ -113,6 +115,21 @@ function send(ws, payload) {
   }
 }
 
+function summarizeTask(task) {
+  if (!task || typeof task !== "object") {
+    return null;
+  }
+  if (task.op === "run_js") {
+    return {
+      op: "run_js",
+      timeoutMs: task.timeoutMs,
+      codeBytes: Buffer.byteLength(String(task.code || ""), "utf8"),
+      hasArgs: task.args !== undefined,
+    };
+  }
+  return task;
+}
+
 function getClientIp(req) {
   const forwardedFor = req.headers["x-forwarded-for"];
   if (TRUST_PROXY && typeof forwardedFor === "string" && forwardedFor.length > 0) {
@@ -153,6 +170,21 @@ app.get(withBasePath("/api/auth/check"), auth.requireClientAuth, (_req, res) => 
   res.json({ ok: true });
 });
 
+app.get(withBasePath("/api/public-config"), (_req, res) => {
+  res.json({
+    jobSigningPublicKeySpkiB64: config.jobSigningPublicKeySpkiB64,
+    signedJobTtlSec: config.signedJobTtlSec,
+    customJobLimits: {
+      maxCodeBytes: config.customJobMaxCodeBytes,
+      maxArgsBytes: config.customJobMaxArgsBytes,
+      maxResultBytes: config.customJobMaxResultBytes,
+      minTimeoutMs: config.customJobMinTimeoutMs,
+      maxTimeoutMs: config.customJobMaxTimeoutMs,
+      defaultTimeoutMs: config.customJobDefaultTimeoutMs,
+    },
+  });
+});
+
 app.post(withBasePath("/api/invites/worker"), auth.requireClientAuth, (req, res) => {
   const parsed = parseInviteRequestBody(req.body);
   if (!parsed.ok) {
@@ -184,6 +216,23 @@ app.post(withBasePath("/api/jobs"), auth.requireClientAuth, (req, res) => {
   return res.status(201).json({ jobId: job.jobId, status: job.status });
 });
 
+app.post(withBasePath("/api/jobs/run-js"), auth.requireClientAuth, (req, res) => {
+  const parsed = parseRunJsCreateBody(req.body, {
+    maxCodeBytes: config.customJobMaxCodeBytes,
+    maxArgsBytes: config.customJobMaxArgsBytes,
+    minTimeoutMs: config.customJobMinTimeoutMs,
+    maxTimeoutMs: config.customJobMaxTimeoutMs,
+    defaultTimeoutMs: config.customJobDefaultTimeoutMs,
+  });
+  if (!parsed.ok) {
+    return res.status(400).json({ error: parsed.error });
+  }
+
+  const job = store.createJob(parsed.value);
+  dispatcher.dispatch();
+  return res.status(201).json({ jobId: job.jobId, status: job.status });
+});
+
 app.get(withBasePath("/api/jobs/:jobId"), auth.requireClientAuth, (req, res) => {
   const { jobId } = req.params;
   const job = store.getJob(jobId);
@@ -193,7 +242,7 @@ app.get(withBasePath("/api/jobs/:jobId"), auth.requireClientAuth, (req, res) => 
   return res.json({
     jobId: job.jobId,
     status: job.status,
-    task: job.task,
+    task: summarizeTask(job.task),
     result: job.result,
     error: job.error,
   });
@@ -363,5 +412,6 @@ server.listen(PORT, HOST, () => {
   if (config.env !== "production") {
     console.log(`[dev] CLIENT_API_KEY=${config.clientApiKey}`);
     console.log(`[dev] WORKER_INVITE_SECRET=${config.workerInviteSecret}`);
+    console.log(`[dev] JOB_SIGNING_PUBLIC_KEY_B64=${config.jobSigningPublicKeySpkiB64}`);
   }
 });

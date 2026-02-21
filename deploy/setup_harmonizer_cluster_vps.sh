@@ -34,6 +34,11 @@ escape_regex() {
   printf '%s' "$1" | sed 's/[.[\*^$()+?{|]/\\&/g'
 }
 
+is_missing_secret() {
+  local value="${1:-}"
+  [[ -z "${value}" || "${value}" == replace_with_* || "${value}" == "change-me" ]]
+}
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -45,29 +50,40 @@ Options:
   --app-user USER              Linux user that owns app files (default: harmonizer)
   --app-group GROUP            Linux group for app files (default: same as app-user)
   --app-dir DIR                Deployment directory (default: /home/harmonizer/apps/cluster)
-  --repo-url URL               Git repository URL to pull from
-  --repo-branch BRANCH         Git branch to deploy (default: light)
+  --source-mode MODE           auto|local|remote (default: auto)
+  --source-dir DIR             Local repo directory to deploy from (default: script parent dir)
+  --repo-url URL               Git repository URL when source-mode=remote
+  --repo-branch BRANCH         Git branch to deploy when source-mode=remote (default: light)
   --service-name NAME          systemd service name (default: cluster-app)
   --app-port PORT              Local app port behind nginx (default: 18080)
   --app-host HOST              Bind host for app service (default: 127.0.0.1)
   --nginx-site-conf PATH       Explicit nginx site file to patch include into
+  --venv-path PATH             Python virtualenv path (default: APP_DIR/.venv)
+  --skip-venv 0|1              Skip creating python virtualenv (default: 0)
   --enable-ufw 0|1             Enable UFW at end of setup (default: 1)
   --install-fail2ban 0|1       Install and enable fail2ban (default: 1)
   --help                       Show this help
 USAGE
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEFAULT_SOURCE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
 DOMAIN="harmonizer.cc"
 BASE_PATH="/cluster"
 APP_USER="harmonizer"
 APP_GROUP=""
 APP_DIR=""
+SOURCE_MODE="auto"
+SOURCE_DIR="${DEFAULT_SOURCE_DIR}"
 REPO_URL="https://github.com/asajid2-cell/E-Waste-Reclamation-via-Beowulf-Cluster.git"
 REPO_BRANCH="light"
 SERVICE_NAME="cluster-app"
 APP_PORT="18080"
 APP_HOST="127.0.0.1"
 NGINX_SITE_CONF=""
+VENV_PATH=""
+SKIP_VENV="0"
 ENABLE_UFW="1"
 INSTALL_FAIL2BAN="1"
 
@@ -93,6 +109,14 @@ while [[ $# -gt 0 ]]; do
       APP_DIR="${2:?missing value}"
       shift 2
       ;;
+    --source-mode)
+      SOURCE_MODE="${2:?missing value}"
+      shift 2
+      ;;
+    --source-dir)
+      SOURCE_DIR="${2:?missing value}"
+      shift 2
+      ;;
     --repo-url)
       REPO_URL="${2:?missing value}"
       shift 2
@@ -115,6 +139,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --nginx-site-conf)
       NGINX_SITE_CONF="${2:?missing value}"
+      shift 2
+      ;;
+    --venv-path)
+      VENV_PATH="${2:?missing value}"
+      shift 2
+      ;;
+    --skip-venv)
+      SKIP_VENV="${2:?missing value}"
       shift 2
       ;;
     --enable-ufw)
@@ -142,19 +174,77 @@ fi
 if [[ -z "${APP_DIR}" ]]; then
   APP_DIR="/home/${APP_USER}/apps/cluster"
 fi
+if [[ -z "${VENV_PATH}" ]]; then
+  VENV_PATH="${APP_DIR}/.venv"
+fi
 
 require_root
+
+if [[ ! "${SOURCE_MODE}" =~ ^(auto|local|remote)$ ]]; then
+  fail "--source-mode must be one of: auto, local, remote"
+fi
+
+if [[ "${SOURCE_MODE}" == "auto" ]]; then
+  if [[ -d "${SOURCE_DIR}/.git" && -f "${SOURCE_DIR}/package.json" ]]; then
+    SOURCE_MODE="local"
+  else
+    SOURCE_MODE="remote"
+  fi
+fi
+
+if [[ "${SOURCE_MODE}" == "local" ]]; then
+  SOURCE_DIR="$(cd "${SOURCE_DIR}" && pwd)"
+  if [[ ! -f "${SOURCE_DIR}/package.json" ]]; then
+    fail "Local source dir does not look like this project: ${SOURCE_DIR}"
+  fi
+fi
 
 if ! command -v apt-get >/dev/null 2>&1; then
   fail "This setup script currently supports Debian/Ubuntu (apt-get)."
 fi
 
+COMPLETED_STEPS=()
+PENDING_STEPS=()
+NOTES=()
+
+mark_done() {
+  COMPLETED_STEPS+=("$1")
+}
+
+mark_pending() {
+  PENDING_STEPS+=("$1")
+}
+
+mark_note() {
+  NOTES+=("$1")
+}
+
+run_as_app() {
+  runuser -u "${APP_USER}" -- bash -lc "$*"
+}
+
 log "Installing base packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y --no-install-recommends ca-certificates curl git gnupg nginx ufw openssl
+apt-get install -y --no-install-recommends \
+  ca-certificates \
+  curl \
+  git \
+  gnupg \
+  nginx \
+  ufw \
+  openssl \
+  rsync \
+  python3 \
+  python3-venv \
+  python3-pip
+mark_done "Installed system packages (nginx, ufw, openssl, rsync, python3, python3-venv, python3-pip)."
+
 if [[ "${INSTALL_FAIL2BAN}" == "1" ]]; then
   apt-get install -y --no-install-recommends fail2ban
+  mark_done "Installed fail2ban."
+else
+  mark_pending "fail2ban install was skipped (--install-fail2ban 0)."
 fi
 
 log "Ensuring Node.js >= 20"
@@ -168,38 +258,71 @@ fi
 if [[ "${need_node_install}" == "1" ]]; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
   apt-get install -y nodejs build-essential
+  mark_done "Installed Node.js 22.x via NodeSource."
+else
+  mark_done "Detected Node.js $(node -v) (>=20)."
 fi
 
 if ! id -u "${APP_USER}" >/dev/null 2>&1; then
   log "Creating app user ${APP_USER}"
   useradd --create-home --shell /bin/bash "${APP_USER}"
+  mark_done "Created app user '${APP_USER}'."
+else
+  mark_done "App user '${APP_USER}' already exists."
 fi
 
 if ! getent group "${APP_GROUP}" >/dev/null 2>&1; then
   log "Creating app group ${APP_GROUP}"
   groupadd "${APP_GROUP}"
-  usermod -a -G "${APP_GROUP}" "${APP_USER}"
-fi
-
-run_as_app() {
-  runuser -u "${APP_USER}" -- bash -lc "$*"
-}
-
-log "Syncing repository into ${APP_DIR}"
-install -d -o "${APP_USER}" -g "${APP_GROUP}" "$(dirname "${APP_DIR}")"
-if [[ -d "${APP_DIR}/.git" ]]; then
-  run_as_app "cd '${APP_DIR}' && git fetch origin '${REPO_BRANCH}' && git checkout '${REPO_BRANCH}' && git reset --hard 'origin/${REPO_BRANCH}'"
+  mark_done "Created app group '${APP_GROUP}'."
 else
-  run_as_app "git clone --branch '${REPO_BRANCH}' '${REPO_URL}' '${APP_DIR}'"
+  mark_done "App group '${APP_GROUP}' already exists."
+fi
+usermod -a -G "${APP_GROUP}" "${APP_USER}"
+
+install -d -o "${APP_USER}" -g "${APP_GROUP}" "$(dirname "${APP_DIR}")"
+install -d -o "${APP_USER}" -g "${APP_GROUP}" "${APP_DIR}"
+
+if [[ "${SOURCE_MODE}" == "local" ]]; then
+  log "Syncing local source ${SOURCE_DIR} into ${APP_DIR}"
+  source_real="$(realpath "${SOURCE_DIR}")"
+  app_real="$(realpath "${APP_DIR}")"
+
+  if [[ "${source_real}" == "${app_real}" ]]; then
+    mark_done "Using local source directory in place: ${APP_DIR}"
+  else
+    rsync -a --delete \
+      --exclude '.git' \
+      --exclude '.github' \
+      --exclude 'node_modules' \
+      --exclude '.env' \
+      --exclude '*.log' \
+      "${SOURCE_DIR}/" "${APP_DIR}/"
+    chown -R "${APP_USER}:${APP_GROUP}" "${APP_DIR}"
+    mark_done "Synced project files from local clone to ${APP_DIR}."
+  fi
+else
+  log "Syncing repository into ${APP_DIR} (remote mode)"
+  if [[ -d "${APP_DIR}/.git" ]]; then
+    run_as_app "cd '${APP_DIR}' && git fetch origin '${REPO_BRANCH}' && git checkout '${REPO_BRANCH}' && git reset --hard 'origin/${REPO_BRANCH}'"
+    mark_done "Updated existing repo in ${APP_DIR} to origin/${REPO_BRANCH}."
+  else
+    run_as_app "rm -rf '${APP_DIR}' && git clone --branch '${REPO_BRANCH}' '${REPO_URL}' '${APP_DIR}'"
+    mark_done "Cloned ${REPO_URL} (${REPO_BRANCH}) into ${APP_DIR}."
+  fi
 fi
 
 ENV_FILE="${APP_DIR}/.env"
 if [[ ! -f "${ENV_FILE}" ]]; then
   if [[ -f "${APP_DIR}/.env.example" ]]; then
     cp "${APP_DIR}/.env.example" "${ENV_FILE}"
+    mark_done "Created ${ENV_FILE} from .env.example."
   else
     touch "${ENV_FILE}"
+    mark_done "Created empty ${ENV_FILE}."
   fi
+else
+  mark_done "Using existing ${ENV_FILE}."
 fi
 
 get_env_value() {
@@ -229,19 +352,24 @@ set_env_key() {
   mv "${tmp}" "${ENV_FILE}"
 }
 
-is_missing_secret() {
-  local value="${1:-}"
-  [[ -z "${value}" || "${value}" == replace_with_* || "${value}" == "change-me" ]]
-}
-
 client_api_key="$(get_env_value CLIENT_API_KEY || true)"
 worker_invite_secret="$(get_env_value WORKER_INVITE_SECRET || true)"
+job_signing_private_key_b64="$(get_env_value JOB_SIGNING_PRIVATE_KEY_B64 || true)"
+job_signing_public_key_b64="$(get_env_value JOB_SIGNING_PUBLIC_KEY_B64 || true)"
 
 if is_missing_secret "${client_api_key}"; then
   client_api_key="$(openssl rand -hex 32)"
 fi
 if is_missing_secret "${worker_invite_secret}"; then
   worker_invite_secret="$(openssl rand -hex 48)"
+fi
+if is_missing_secret "${job_signing_private_key_b64}" || is_missing_secret "${job_signing_public_key_b64}"; then
+  log "Generating RSA signing keypair for signed jobs"
+  job_signing_private_key_b64="$(openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -outform DER 2>/dev/null | base64 | tr -d '\n')"
+  job_signing_public_key_b64="$(
+    printf '%s' "${job_signing_private_key_b64}" | base64 -d | \
+      openssl pkey -inform DER -pubout -outform DER 2>/dev/null | base64 | tr -d '\n'
+  )"
 fi
 
 set_env_key "NODE_ENV" "production"
@@ -251,12 +379,31 @@ set_env_key "TRUST_PROXY" "1"
 set_env_key "BASE_PATH" "${BASE_PATH}"
 set_env_key "CLIENT_API_KEY" "${client_api_key}"
 set_env_key "WORKER_INVITE_SECRET" "${worker_invite_secret}"
+set_env_key "JOB_SIGNING_PRIVATE_KEY_B64" "${job_signing_private_key_b64}"
+set_env_key "JOB_SIGNING_PUBLIC_KEY_B64" "${job_signing_public_key_b64}"
 
 chown "${APP_USER}:${APP_GROUP}" "${ENV_FILE}"
 chmod 600 "${ENV_FILE}"
+mark_done "Configured app environment keys and secure permissions on ${ENV_FILE}."
 
-log "Installing production dependencies"
+if [[ "${SKIP_VENV}" == "0" ]]; then
+  log "Creating/updating python virtualenv at ${VENV_PATH}"
+  run_as_app "python3 -m venv '${VENV_PATH}'"
+  run_as_app "source '${VENV_PATH}/bin/activate' && python -m pip install --upgrade pip setuptools wheel"
+  if [[ -f "${APP_DIR}/requirements.txt" ]]; then
+    run_as_app "source '${VENV_PATH}/bin/activate' && cd '${APP_DIR}' && pip install -r requirements.txt"
+    mark_done "Created python venv and installed requirements.txt."
+  else
+    mark_done "Created python venv and upgraded pip/setuptools/wheel."
+    mark_pending "No requirements.txt found; no project-specific Python packages installed."
+  fi
+else
+  mark_pending "Python virtualenv creation skipped (--skip-venv 1)."
+fi
+
+log "Installing production node dependencies"
 run_as_app "cd '${APP_DIR}' && npm ci --omit=dev"
+mark_done "Installed npm production dependencies."
 
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 log "Writing systemd service ${SERVICE_NAME}"
@@ -283,9 +430,11 @@ UMask=027
 [Install]
 WantedBy=multi-user.target
 EOF
+mark_done "Wrote systemd unit ${SERVICE_FILE}."
 
 systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}"
+mark_done "Enabled and started systemd service ${SERVICE_NAME}."
 
 if [[ -z "${NGINX_SITE_CONF}" ]]; then
   domain_regex="$(escape_regex "${DOMAIN}")"
@@ -310,7 +459,7 @@ location = ${BASE_PATH} {
 }
 
 location ^~ ${BASE_PATH}/ {
-    proxy_pass http://127.0.0.1:${APP_PORT};
+    proxy_pass http://${APP_HOST}:${APP_PORT};
     proxy_http_version 1.1;
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
@@ -322,6 +471,7 @@ location ^~ ${BASE_PATH}/ {
     proxy_send_timeout 300s;
 }
 EOF
+mark_done "Wrote nginx snippet ${NGINX_SNIPPET}."
 
 include_line="include ${NGINX_SNIPPET};"
 if ! grep -Fq "${include_line}" "${NGINX_SITE_CONF}"; then
@@ -329,15 +479,19 @@ if ! grep -Fq "${include_line}" "${NGINX_SITE_CONF}"; then
   cp "${NGINX_SITE_CONF}" "${NGINX_SITE_CONF}.bak.$(date +%Y%m%d%H%M%S)"
   domain_regex="$(escape_regex "${DOMAIN}")"
   sed -i "/server_name[[:space:]].*${domain_regex}/a\\    ${include_line}" "${NGINX_SITE_CONF}"
+  mark_done "Injected nginx include into ${NGINX_SITE_CONF}."
+else
+  mark_done "Nginx include already present in ${NGINX_SITE_CONF}."
 fi
 
 log "Testing and reloading nginx"
 nginx -t
 systemctl reload nginx
+mark_done "nginx config test and reload succeeded."
 
 if [[ "${INSTALL_FAIL2BAN}" == "1" ]]; then
-  log "Enabling fail2ban"
   systemctl enable --now fail2ban
+  mark_done "Enabled fail2ban."
 fi
 
 if command -v ufw >/dev/null 2>&1; then
@@ -347,14 +501,77 @@ if command -v ufw >/dev/null 2>&1; then
   ufw allow 443/tcp >/dev/null || true
   if [[ "${ENABLE_UFW}" == "1" ]]; then
     ufw --force enable >/dev/null || true
+    mark_done "Applied firewall rules and ensured UFW is enabled."
+  else
+    mark_pending "UFW enable skipped (--enable-ufw 0); rules were added but firewall may be inactive."
   fi
 fi
 
-log "Performing local health check"
-curl -fsS "http://127.0.0.1:${APP_PORT}${BASE_PATH}/health" >/dev/null
+HEALTH_URL="http://${APP_HOST}:${APP_PORT}${BASE_PATH}/health"
+log "Performing local health check: ${HEALTH_URL}"
+if curl -fsS "${HEALTH_URL}" >/dev/null; then
+  mark_done "Local health check passed (${HEALTH_URL})."
+else
+  mark_pending "Local health check failed (${HEALTH_URL})."
+fi
+
+if systemctl is-active --quiet "${SERVICE_NAME}"; then
+  mark_done "Service ${SERVICE_NAME} is active."
+else
+  mark_pending "Service ${SERVICE_NAME} is not active."
+fi
+
+if systemctl is-active --quiet nginx; then
+  mark_done "nginx service is active."
+else
+  mark_pending "nginx service is not active."
+fi
+
+if getent ahostsv4 "${DOMAIN}" >/dev/null 2>&1; then
+  mark_done "Domain ${DOMAIN} resolves via DNS."
+else
+  mark_pending "Domain ${DOMAIN} does not currently resolve on this VPS; verify DNS A/AAAA records."
+fi
+
+mark_pending "Run an external test from a phone/another network: https://${DOMAIN}${BASE_PATH}/health"
+mark_pending "Generate a worker invite from /client and verify join + job completion end-to-end."
+
+REPORT_FILE="${APP_DIR}/deploy-status.txt"
+{
+  echo "Cluster Deployment Status Report"
+  echo "Generated at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  echo "Domain: ${DOMAIN}"
+  echo "Base Path: ${BASE_PATH}"
+  echo "App Dir: ${APP_DIR}"
+  echo "Service: ${SERVICE_NAME}"
+  echo "Source Mode: ${SOURCE_MODE}"
+  echo
+  echo "Completed:"
+  for item in "${COMPLETED_STEPS[@]}"; do
+    echo "  - ${item}"
+  done
+  echo
+  echo "Pending / Manual Follow-up:"
+  for item in "${PENDING_STEPS[@]}"; do
+    echo "  - ${item}"
+  done
+  if [[ "${#NOTES[@]}" -gt 0 ]]; then
+    echo
+    echo "Notes:"
+    for item in "${NOTES[@]}"; do
+      echo "  - ${item}"
+    done
+  fi
+  echo
+  echo "URLs:"
+  echo "  - Client: https://${DOMAIN}${BASE_PATH}/client"
+  echo "  - Worker entry: https://${DOMAIN}${BASE_PATH}/worker?invite=..."
+  echo "  - Health (public): https://${DOMAIN}${BASE_PATH}/health"
+  echo "  - Health (local): ${HEALTH_URL}"
+} | tee "${REPORT_FILE}"
+
+chown "${APP_USER}:${APP_GROUP}" "${REPORT_FILE}" || true
 
 log "Setup complete."
-log "Cluster client URL: https://${DOMAIN}${BASE_PATH}/client"
-log "Worker entry URL:  https://${DOMAIN}${BASE_PATH}/worker?invite=..."
-log "Service status: systemctl status ${SERVICE_NAME} --no-pager"
-log "Client API token saved in: ${ENV_FILE}"
+log "Status report saved to ${REPORT_FILE}"
+log "Client API token is stored in ${ENV_FILE}"

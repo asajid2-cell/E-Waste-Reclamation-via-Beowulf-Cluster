@@ -1,6 +1,22 @@
-function createDispatcher(store, log = console) {
+function createDispatcher(store, auth, log = console) {
   function sendJson(ws, payload) {
     ws.send(JSON.stringify(payload));
+  }
+
+  function buildWorkerPayload(job) {
+    if (!job || !job.task || typeof job.task.op !== "string") {
+      throw new Error("Invalid job payload.");
+    }
+    if (job.task.op === "run_js") {
+      if (!auth || typeof auth.signWorkerAssignment !== "function") {
+        throw new Error("Missing worker assignment signer.");
+      }
+      return {
+        op: "run_js",
+        signedTask: auth.signWorkerAssignment(job),
+      };
+    }
+    return job.task;
   }
 
   function dispatch() {
@@ -29,15 +45,19 @@ function createDispatcher(store, log = console) {
       }
 
       try {
+        const workerPayload = buildWorkerPayload(nextJob);
         sendJson(worker.ws, {
           type: "assign",
           jobId: nextJob.jobId,
-          payload: nextJob.task,
+          payload: workerPayload,
         });
       } catch (error) {
-        log.error("Failed to send job assignment:", error.message);
-        store.removeWorkerSocket(worker.ws);
-        store.requeueJob(nextJob.jobId, true);
+        log.error("Failed to assign job:", error.message);
+        const failAttempt = store.failJob(worker.workerId, nextJob.jobId, `dispatch_error:${error.message}`);
+        if (!failAttempt.ok) {
+          store.removeWorkerSocket(worker.ws);
+          store.requeueJob(nextJob.jobId, true);
+        }
       }
     }
   }
