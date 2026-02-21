@@ -60,10 +60,23 @@
         display: grid;
         gap: 0.6rem;
       }
-      .custom-row {
+      .script-options-row {
         display: grid;
         grid-template-columns: 1fr 180px auto;
         gap: 0.6rem;
+      }
+      .file-picker {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 0.6rem;
+        align-items: center;
+      }
+      .file-picker input[type="file"] {
+        display: none;
+      }
+      .file-name {
+        color: var(--muted);
+        overflow-wrap: anywhere;
       }
       input,
       button,
@@ -86,6 +99,10 @@
       }
       button.secondary {
         background: #8ecae6;
+      }
+      button.file-btn {
+        border-color: #7fc6dd;
+        background: linear-gradient(180deg, #9dd8eb, #78bfd8);
       }
       button.warn {
         background: var(--warn);
@@ -142,7 +159,8 @@
       @media (max-width: 780px) {
         form,
         .row,
-        .custom-row {
+        .script-options-row,
+        .file-picker {
           grid-template-columns: 1fr;
         }
       }
@@ -189,11 +207,29 @@
       <div class="card stack">
         <strong>Run Your Own JS (Signed)</strong>
         <div class="custom-form">
-          <input id="scriptFile" type="file" accept=".js,text/javascript" />
-          <textarea id="scriptCode" class="mono" placeholder="Example: return (args.a || 0) + (args.b || 0);"></textarea>
-          <div class="custom-row">
-            <textarea id="scriptArgs" class="mono" placeholder='Args JSON, e.g. {"a":2,"b":2}'>{}</textarea>
-            <input id="scriptTimeoutMs" type="number" min="200" step="100" placeholder="run timeout ms" />
+          <div class="file-picker">
+            <input id="scriptFile" type="file" accept=".js,text/javascript" />
+            <button id="scriptFileBtn" class="secondary file-btn" type="button">Choose JS File</button>
+            <span id="scriptFileName" class="mono file-name">No file chosen</span>
+          </div>
+          <textarea
+            id="scriptCode"
+            class="mono"
+            placeholder="Example:
+const samples = Number(args.samples || 1_000_000);
+let hits = 0;
+for (let i = 0; i < samples; i += 1) {
+  const x = Math.random();
+  const y = Math.random();
+  if (x * x + y * y <= 1) hits += 1;
+}
+const pi = 4 * hits / samples;
+console.log('estimated pi:', pi);
+return { samples, hits, pi };"
+          ></textarea>
+          <div class="script-options-row">
+            <input id="scriptArgs" class="mono" placeholder='args JSON (optional), e.g. {"samples":10000000}' />
+            <input id="scriptTimeoutMs" type="number" min="200" step="100" placeholder="run timeout ms (optional)" />
             <button id="submitScriptBtn" type="button">Run Script</button>
           </div>
         </div>
@@ -242,6 +278,8 @@
       const submitAddBtn = document.getElementById("submitAddBtn");
 
       const scriptFileEl = document.getElementById("scriptFile");
+      const scriptFileBtnEl = document.getElementById("scriptFileBtn");
+      const scriptFileNameEl = document.getElementById("scriptFileName");
       const scriptCodeEl = document.getElementById("scriptCode");
       const scriptArgsEl = document.getElementById("scriptArgs");
       const scriptTimeoutMsEl = document.getElementById("scriptTimeoutMs");
@@ -299,6 +337,72 @@
       function formatResult(value) {
         if (value === null || value === undefined) {
           return "-";
+        }
+        if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+          const isRunJsEnvelope =
+            Object.prototype.hasOwnProperty.call(value, "exitCode") &&
+            Object.prototype.hasOwnProperty.call(value, "output");
+          if (isRunJsEnvelope) {
+            const lines = [];
+            lines.push(`ok: ${value.ok === true}`);
+            lines.push(`exitCode: ${value.exitCode}`);
+            if (typeof value.durationMs === "number") {
+              lines.push(`durationMs: ${value.durationMs}`);
+            }
+            if (value.returnType) {
+              lines.push(`returnType: ${value.returnType}`);
+            }
+            if (value.argsType) {
+              lines.push(`argsType: ${value.argsType}`);
+            }
+            if (value.output && typeof value.output.bytes === "number") {
+              lines.push(`outputBytes: ${value.output.bytes}`);
+            }
+            if (value.output && value.output.truncated === true) {
+              lines.push("outputTruncated: true");
+            }
+            if (value.output && typeof value.output.text === "string" && value.output.text.length > 0) {
+              lines.push("");
+              lines.push("output:");
+              lines.push(value.output.text);
+            }
+            if (Array.isArray(value.logs) && value.logs.length > 0) {
+              lines.push("");
+              lines.push("logs:");
+              lines.push(value.logs.join("\n"));
+            }
+            if (Object.prototype.hasOwnProperty.call(value, "returnValue")) {
+              lines.push("");
+              lines.push("returnValue:");
+              try {
+                lines.push(JSON.stringify(value.returnValue, null, 2));
+              } catch (_err) {
+                lines.push("[unserializable returnValue]");
+              }
+            }
+            if (value.error && value.error.message) {
+              lines.push("");
+              lines.push(`error: ${value.error.message}`);
+              if (value.error.stack) {
+                lines.push(value.error.stack);
+              }
+            }
+            if (Array.isArray(value.notes) && value.notes.length > 0) {
+              lines.push("");
+              lines.push("notes:");
+              lines.push(value.notes.join("\n"));
+            }
+            if (value.stats && typeof value.stats === "object") {
+              lines.push("");
+              lines.push("stats:");
+              try {
+                lines.push(JSON.stringify(value.stats, null, 2));
+              } catch (_err) {
+                lines.push("[unserializable stats]");
+              }
+            }
+            return lines.join("\n");
+          }
         }
         if (typeof value === "string") {
           return value;
@@ -482,26 +586,38 @@
           return;
         }
 
-        let args = {};
-        try {
-          args = JSON.parse(scriptArgsEl.value || "{}");
-        } catch (_err) {
-          errorEl.textContent = "Args must be valid JSON.";
-          return;
+        const body = { code };
+        const rawArgs = scriptArgsEl.value.trim();
+        if (rawArgs) {
+          try {
+            body.args = JSON.parse(rawArgs);
+          } catch (_err) {
+            errorEl.textContent = "Args must be valid JSON.";
+            return;
+          }
         }
-
-        const body = { code, args };
         if (scriptTimeoutMsEl.value.trim()) {
-          body.timeoutMs = Number(scriptTimeoutMsEl.value);
+          const timeoutMs = Number(scriptTimeoutMsEl.value);
+          if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+            errorEl.textContent = "Timeout must be a positive number.";
+            return;
+          }
+          body.timeoutMs = timeoutMs;
         }
         await submitAndPoll("/api/jobs/run-js", body);
+      });
+
+      scriptFileBtnEl.addEventListener("click", () => {
+        scriptFileEl.click();
       });
 
       scriptFileEl.addEventListener("change", () => {
         const file = scriptFileEl.files && scriptFileEl.files[0];
         if (!file) {
+          scriptFileNameEl.textContent = "No file chosen";
           return;
         }
+        scriptFileNameEl.textContent = file.name;
         const reader = new FileReader();
         reader.onload = () => {
           scriptCodeEl.value = String(reader.result || "");

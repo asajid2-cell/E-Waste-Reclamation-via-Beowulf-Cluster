@@ -60,6 +60,20 @@
       .err {
         color: var(--error);
       }
+      button {
+        border-radius: 8px;
+        border: 1px solid #4c6898;
+        padding: 0.45rem 0.7rem;
+        font-size: 0.9rem;
+        background: #7ec8e3;
+        color: #001219;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
       #log {
         white-space: pre-wrap;
         background: #0e1e35;
@@ -82,6 +96,12 @@
         <p>Worker ID: <span class="mono" id="workerId"></span></p>
         <p>Current Job: <span class="mono" id="currentJob">idle</span></p>
         <p>Invite: <span id="inviteState" class="mono"></span></p>
+        <p>
+          Keep Awake:
+          <span id="wakeState" class="pill connecting">checking</span>
+          <button id="wakeBtn" type="button">Enable</button>
+        </p>
+        <p id="wakeHint" class="mono"></p>
         <p id="inviteError" class="err"></p>
       </div>
 
@@ -339,7 +359,8 @@ self.onmessage = async (event) => {
   let envelope = null;
 
   try {
-    const fn = new Function("args", "console", '"use strict";\\n' + code);
+    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+    const fn = new AsyncFunction("args", "console", '"use strict";\\n' + code);
     const rawResult = await fn(args, capturedConsole);
     const normalized = normalizeReturnValue(rawResult);
     if (normalized.note) {
@@ -440,6 +461,9 @@ self.onmessage = async (event) => {
       const workerIdEl = document.getElementById("workerId");
       const currentJobEl = document.getElementById("currentJob");
       const inviteStateEl = document.getElementById("inviteState");
+      const wakeStateEl = document.getElementById("wakeState");
+      const wakeBtnEl = document.getElementById("wakeBtn");
+      const wakeHintEl = document.getElementById("wakeHint");
       const inviteErrorEl = document.getElementById("inviteError");
       const logEl = document.getElementById("log");
 
@@ -452,6 +476,7 @@ self.onmessage = async (event) => {
       let reconnectTimer = null;
       let verifyKeyPromise = null;
       let maxResultBytes = DEFAULT_MAX_RESULT_BYTES;
+      let wakeLockSentinel = null;
 
       workerIdEl.textContent = workerId;
       inviteStateEl.textContent = inviteToken ? "present" : "missing";
@@ -466,6 +491,85 @@ self.onmessage = async (event) => {
         connStateEl.textContent = state;
         connStateEl.className = "pill";
         connStateEl.classList.add(state);
+      }
+
+      function setWakeState(state, hint) {
+        wakeStateEl.textContent = state;
+        wakeStateEl.className = "pill";
+        if (state === "active") {
+          wakeStateEl.classList.add("connected");
+        } else if (state === "unsupported" || state === "blocked") {
+          wakeStateEl.classList.add("disconnected");
+        } else {
+          wakeStateEl.classList.add("connecting");
+        }
+        wakeHintEl.textContent = hint || "";
+      }
+
+      function isWakeLockSupported() {
+        return Boolean(navigator.wakeLock && typeof navigator.wakeLock.request === "function");
+      }
+
+      async function requestWakeLock(reason) {
+        if (!isWakeLockSupported()) {
+          wakeBtnEl.disabled = true;
+          setWakeState(
+            "unsupported",
+            "This browser cannot keep the screen awake from a webpage. Disable sleep manually in device settings.",
+          );
+          return;
+        }
+
+        if (document.visibilityState !== "visible") {
+          setWakeState("paused", "Tab not visible. Keep this page in the foreground while volunteering.");
+          return;
+        }
+
+        if (wakeLockSentinel) {
+          setWakeState("active", "Screen wake lock is active.");
+          return;
+        }
+
+        try {
+          wakeLockSentinel = await navigator.wakeLock.request("screen");
+          wakeLockSentinel.addEventListener("release", () => {
+            wakeLockSentinel = null;
+            if (document.visibilityState === "visible") {
+              setWakeState("released", "Wake lock was released. Re-requesting...");
+              requestWakeLock("released").catch(() => {});
+            } else {
+              setWakeState("paused", "Wake lock released while backgrounded.");
+            }
+          });
+          setWakeState("active", "Screen wake lock is active.");
+          appendLog(`wake lock active (${reason})`);
+        } catch (error) {
+          const message = error && error.message ? error.message : "request failed";
+          setWakeState("blocked", `Wake lock failed: ${message}. Tap Enable and keep this tab visible.`);
+          appendLog(`wake lock failed (${reason}): ${message}`);
+        }
+      }
+
+      function initializeWakeLock() {
+        wakeBtnEl.disabled = false;
+        setWakeState("checking", "Requesting wake lock to keep the screen on.");
+        requestWakeLock("startup").catch(() => {});
+
+        wakeBtnEl.addEventListener("click", () => {
+          requestWakeLock("manual").catch(() => {});
+        });
+
+        document.addEventListener("visibilitychange", () => {
+          if (document.visibilityState === "visible") {
+            requestWakeLock("visible").catch(() => {});
+          } else if (wakeLockSentinel) {
+            setWakeState("paused", "Page hidden. Wake lock will resume when visible.");
+          }
+        });
+
+        window.addEventListener("focus", () => {
+          requestWakeLock("focus").catch(() => {});
+        });
       }
 
       function send(message) {
@@ -854,6 +958,7 @@ self.onmessage = async (event) => {
       }
 
       connect();
+      initializeWakeLock();
     </script>
   </body>
 </html>
