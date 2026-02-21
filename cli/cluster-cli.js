@@ -123,10 +123,36 @@ async function requestJson({ url, method = "GET", token, body }) {
 }
 
 function formatResult(result) {
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    const isEnvelope = Object.prototype.hasOwnProperty.call(result, "exitCode") && Object.prototype.hasOwnProperty.call(result, "output");
+    if (isEnvelope) {
+      const lines = [];
+      lines.push(`ok=${result.ok === true ? "true" : "false"} exitCode=${result.exitCode}`);
+      if (typeof result.durationMs === "number") {
+        lines.push(`durationMs=${result.durationMs}`);
+      }
+      if (result.output && typeof result.output.text === "string" && result.output.text.length > 0) {
+        lines.push("output:");
+        lines.push(result.output.text);
+      }
+      if (result.error && typeof result.error === "object" && result.error.message) {
+        lines.push(`error: ${result.error.message}`);
+      }
+      if (Object.prototype.hasOwnProperty.call(result, "returnValue")) {
+        try {
+          lines.push(`returnValue: ${JSON.stringify(result.returnValue)}`);
+        } catch (_error) {
+          lines.push("returnValue: [unserializable]");
+        }
+      }
+      return lines.join("\n");
+    }
+  }
+
   if (typeof result === "string") {
     return result;
   }
-  return JSON.stringify(result);
+  return JSON.stringify(result, null, 2);
 }
 
 async function waitForJob({ host, token, jobId, timeoutMs }) {

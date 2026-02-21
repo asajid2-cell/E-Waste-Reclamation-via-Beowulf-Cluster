@@ -95,6 +95,7 @@
       const WORKER_ID_KEY = "cluster_worker_id";
       const MAX_RECONNECT_MS = 10_000;
       const MAX_CLOCK_SKEW_MS = 30_000;
+      const DEFAULT_MAX_RESULT_BYTES = 64 * 1024;
       const BASE_PATH = (() => {
         const path = window.location.pathname.replace(/\/+$/, "");
         if (path.endsWith("/worker")) {
@@ -104,25 +105,300 @@
       })();
 
       const EXECUTOR_SOURCE = `
+const EXECUTOR_DONE_FLAG = "__cluster_exec_done__";
+const MAX_LOG_LINES = 160;
+const MAX_LOG_LINE_CHARS = 280;
+const MAX_OUTPUT_CHARS = 28 * 1024;
+const MAX_ERROR_CHARS = 6 * 1024;
+const MAX_STACK_CHARS = 10 * 1024;
+const MAX_RETURN_PREVIEW_CHARS = 4 * 1024;
+const DEFAULT_RESULT_BUDGET_BYTES = 64 * 1024;
+
+function utf8Bytes(input) {
+  return new TextEncoder().encode(String(input)).length;
+}
+
+function valueType(value) {
+  if (value === null) {
+    return "null";
+  }
+  if (Array.isArray(value)) {
+    return "array";
+  }
+  return typeof value;
+}
+
+function clampChars(input, maxChars) {
+  const text = String(input);
+  if (text.length <= maxChars) {
+    return text;
+  }
+  return text.slice(0, Math.max(0, maxChars - 3)) + "...";
+}
+
+function safeJsonStringify(value) {
+  try {
+    return { ok: true, json: JSON.stringify(value) };
+  } catch (_error) {
+    return { ok: false, json: "" };
+  }
+}
+
+function formatLogArg(arg) {
+  if (typeof arg === "string") {
+    return arg;
+  }
+  const asJson = safeJsonStringify(arg);
+  if (asJson.ok && asJson.json !== undefined) {
+    return asJson.json;
+  }
+  try {
+    return String(arg);
+  } catch (_error) {
+    return "[unprintable]";
+  }
+}
+
+function makeOutputEnvelope(rawOutput, wasTruncated) {
+  return {
+    text: rawOutput,
+    truncated: Boolean(wasTruncated),
+    bytes: utf8Bytes(rawOutput),
+  };
+}
+
+function normalizeReturnValue(rawResult) {
+  const serialized = safeJsonStringify(rawResult);
+  if (!serialized.ok) {
+    return {
+      value: {
+        nonSerializable: true,
+        type: valueType(rawResult),
+        preview: clampChars(formatLogArg(rawResult), MAX_RETURN_PREVIEW_CHARS),
+      },
+      returnType: valueType(rawResult),
+      serializedBytes: null,
+      normalized: false,
+      note: "Result was not JSON-serializable.",
+    };
+  }
+
+  if (serialized.json === undefined) {
+    return {
+      value: null,
+      returnType: "undefined",
+      serializedBytes: utf8Bytes("null"),
+      normalized: true,
+      note: "Script returned undefined.",
+    };
+  }
+
+  const serializedBytes = utf8Bytes(serialized.json);
+  if (serializedBytes > DEFAULT_RESULT_BUDGET_BYTES / 2) {
+    return {
+      value: {
+        truncated: true,
+        type: valueType(rawResult),
+        totalSerializedBytes: serializedBytes,
+        preview: clampChars(serialized.json, MAX_RETURN_PREVIEW_CHARS),
+      },
+      returnType: valueType(rawResult),
+      serializedBytes,
+      normalized: true,
+      note: "Result was large and was summarized.",
+    };
+  }
+
+  return {
+    value: JSON.parse(serialized.json),
+    returnType: valueType(rawResult),
+    serializedBytes,
+    normalized: true,
+    note: null,
+  };
+}
+
+function clampEnvelopeToBudget(envelope, budgetBytes) {
+  const budget = Number.isFinite(Number(budgetBytes)) ? Math.max(4 * 1024, Number(budgetBytes)) : DEFAULT_RESULT_BUDGET_BYTES;
+
+  function fits(payload) {
+    const json = JSON.stringify(payload);
+    if (json === undefined) {
+      return false;
+    }
+    return utf8Bytes(json) <= budget;
+  }
+
+  if (fits(envelope)) {
+    return envelope;
+  }
+
+  const next = { ...envelope };
+  if (next.output && typeof next.output.text === "string" && next.output.text.length > 0) {
+    next.output = makeOutputEnvelope(clampChars(next.output.text, Math.floor(next.output.text.length * 0.55)), true);
+  }
+  if (fits(next)) {
+    return next;
+  }
+
+  next.logs = [];
+  if (fits(next)) {
+    return next;
+  }
+
+  if (next.error) {
+    if (typeof next.error.stack === "string") {
+      next.error.stack = clampChars(next.error.stack, 1024);
+    }
+    if (typeof next.error.message === "string") {
+      next.error.message = clampChars(next.error.message, 512);
+    }
+  }
+  if (fits(next)) {
+    return next;
+  }
+
+  next.returnValue = {
+    truncated: true,
+    preview: clampChars(formatLogArg(next.returnValue), 1024),
+  };
+  next.notes = (Array.isArray(next.notes) ? next.notes : []).concat("Result trimmed to fit server size limit.");
+  if (fits(next)) {
+    return next;
+  }
+
+  return {
+    ok: false,
+    exitCode: 70,
+    durationMs: Number(next.durationMs) || 0,
+    returnType: "none",
+    returnValue: null,
+    argsType: next.argsType || "unknown",
+    logs: [],
+    output: makeOutputEnvelope("", false),
+    error: {
+      message: "Execution result exceeded transport budget.",
+      stack: null,
+    },
+    notes: ["Result was aggressively trimmed due to size constraints."],
+  };
+}
+
 self.onmessage = async (event) => {
+  const startedAt = Date.now();
   const payload = event.data || {};
   const code = typeof payload.code === "string" ? payload.code : "";
   const args = payload.args;
-  try {
-    const fn = new Function("args", '"use strict";\\n' + code);
-    const rawResult = await fn(args);
-    let normalized = null;
-    try {
-      const resultJson = JSON.stringify(rawResult);
-      normalized = resultJson === undefined ? null : JSON.parse(resultJson);
-    } catch (_resultError) {
-      throw new Error("Result is not JSON-serializable");
+  const resultBudgetBytes = payload.resultBudgetBytes;
+  const notes = [];
+
+  let outputChars = 0;
+  let outputText = "";
+  let outputTruncated = false;
+  let droppedLogs = 0;
+  const logs = [];
+
+  function appendOutput(level, entries) {
+    const rendered = entries.map((entry) => formatLogArg(entry)).join(" ");
+    const line = "[" + level + "] " + clampChars(rendered, MAX_LOG_LINE_CHARS);
+    if (logs.length >= MAX_LOG_LINES) {
+      logs.shift();
+      droppedLogs += 1;
     }
-    self.postMessage({ ok: true, result: normalized });
-  } catch (error) {
-    const message = error && error.message ? error.message : "Execution failed";
-    self.postMessage({ ok: false, error: message });
+    logs.push(line);
+
+    if (outputTruncated) {
+      return;
+    }
+    const suffix = outputText.length === 0 ? line : "\\n" + line;
+    if (outputChars + suffix.length > MAX_OUTPUT_CHARS) {
+      const remaining = Math.max(0, MAX_OUTPUT_CHARS - outputChars);
+      outputText += suffix.slice(0, remaining);
+      outputChars = outputText.length;
+      outputTruncated = true;
+      return;
+    }
+    outputText += suffix;
+    outputChars = outputText.length;
   }
+
+  const capturedConsole = {
+    log: (...entries) => appendOutput("log", entries),
+    info: (...entries) => appendOutput("info", entries),
+    warn: (...entries) => appendOutput("warn", entries),
+    error: (...entries) => appendOutput("error", entries),
+    debug: (...entries) => appendOutput("debug", entries),
+  };
+  capturedConsole.trace = (...entries) => {
+    appendOutput("trace", entries);
+  };
+
+  const previousConsole = self.console;
+  self.console = capturedConsole;
+
+  let envelope = null;
+
+  try {
+    const fn = new Function("args", "console", '"use strict";\\n' + code);
+    const rawResult = await fn(args, capturedConsole);
+    const normalized = normalizeReturnValue(rawResult);
+    if (normalized.note) {
+      notes.push(normalized.note);
+    }
+    envelope = {
+      ok: true,
+      exitCode: 0,
+      durationMs: Date.now() - startedAt,
+      returnType: normalized.returnType,
+      returnValue: normalized.value,
+      argsType: valueType(args),
+      logs,
+      output: makeOutputEnvelope(outputText, outputTruncated),
+      error: null,
+      notes,
+      stats: {
+        droppedLogs,
+        serializedReturnBytes: normalized.serializedBytes,
+      },
+    };
+  } catch (error) {
+    const message = error && error.message ? clampChars(error.message, MAX_ERROR_CHARS) : "Execution failed";
+    const stack = error && error.stack ? clampChars(error.stack, MAX_STACK_CHARS) : null;
+    envelope = {
+      ok: false,
+      exitCode: 1,
+      durationMs: Date.now() - startedAt,
+      returnType: "none",
+      returnValue: null,
+      argsType: valueType(args),
+      logs,
+      output: makeOutputEnvelope(outputText, outputTruncated),
+      error: {
+        message,
+        stack,
+      },
+      notes,
+      stats: {
+        droppedLogs,
+        serializedReturnBytes: null,
+      },
+    };
+  } finally {
+    self.console = previousConsole;
+  }
+
+  if (outputTruncated) {
+    envelope.notes = (Array.isArray(envelope.notes) ? envelope.notes : []).concat("Console output was truncated.");
+  }
+  if (droppedLogs > 0) {
+    envelope.notes = (Array.isArray(envelope.notes) ? envelope.notes : []).concat("Old log lines were dropped due to volume.");
+  }
+
+  const boundedEnvelope = clampEnvelopeToBudget(envelope, resultBudgetBytes);
+  self.postMessage({
+    [EXECUTOR_DONE_FLAG]: true,
+    result: boundedEnvelope,
+  });
 };
 `;
 
@@ -175,6 +451,7 @@ self.onmessage = async (event) => {
       let reconnectDelay = 500;
       let reconnectTimer = null;
       let verifyKeyPromise = null;
+      let maxResultBytes = DEFAULT_MAX_RESULT_BYTES;
 
       workerIdEl.textContent = workerId;
       inviteStateEl.textContent = inviteToken ? "present" : "missing";
@@ -216,6 +493,16 @@ self.onmessage = async (event) => {
         const config = await response.json();
         if (!config || typeof config.jobSigningPublicKeySpkiB64 !== "string" || !config.jobSigningPublicKeySpkiB64) {
           throw new Error("Missing signing public key.");
+        }
+        const configuredResultLimit =
+          config &&
+          config.customJobLimits &&
+          Number.isInteger(config.customJobLimits.maxResultBytes) &&
+          config.customJobLimits.maxResultBytes > 0
+            ? config.customJobLimits.maxResultBytes
+            : null;
+        if (configuredResultLimit) {
+          maxResultBytes = configuredResultLimit;
         }
         const keyData = base64ToBytes(config.jobSigningPublicKeySpkiB64);
         return crypto.subtle.importKey(
@@ -326,37 +613,101 @@ self.onmessage = async (event) => {
         return payload.task;
       }
 
-      function executeScript(code, args, timeoutMs) {
-        return new Promise((resolve, reject) => {
+      function executeScript(code, args, timeoutMs, resultBudgetBytes) {
+        return new Promise((resolve) => {
           const blob = new Blob([EXECUTOR_SOURCE], { type: "application/javascript" });
           const runnerUrl = URL.createObjectURL(blob);
           const runner = new Worker(runnerUrl);
-          const timeout = setTimeout(() => {
+          let settled = false;
+          const finish = (value) => {
+            if (settled) {
+              return;
+            }
+            settled = true;
+            clearTimeout(timeout);
             runner.terminate();
             URL.revokeObjectURL(runnerUrl);
-            reject(new Error("Execution timeout exceeded"));
+            resolve(value);
+          };
+          const timeout = setTimeout(() => {
+            finish({
+              ok: false,
+              exitCode: 124,
+              durationMs: timeoutMs,
+              returnType: "none",
+              returnValue: null,
+              argsType: args === null ? "null" : Array.isArray(args) ? "array" : typeof args,
+              logs: [],
+              output: {
+                text: "",
+                truncated: false,
+                bytes: 0,
+              },
+              error: {
+                message: "Execution timeout exceeded",
+                stack: null,
+              },
+              notes: [],
+            });
           }, timeoutMs);
 
           runner.addEventListener("message", (event) => {
-            clearTimeout(timeout);
-            runner.terminate();
-            URL.revokeObjectURL(runnerUrl);
             const message = event.data || {};
-            if (message.ok) {
-              resolve(message.result);
+            if (message.__cluster_exec_done__ !== true) {
               return;
             }
-            reject(new Error(message.error || "Execution failed"));
+            if (Object.prototype.hasOwnProperty.call(message, "result")) {
+              finish(message.result);
+              return;
+            }
+            finish({
+              ok: false,
+              exitCode: 70,
+              durationMs: 0,
+              returnType: "none",
+              returnValue: null,
+              argsType: args === null ? "null" : Array.isArray(args) ? "array" : typeof args,
+              logs: [],
+              output: {
+                text: "",
+                truncated: false,
+                bytes: 0,
+              },
+              error: {
+                message: "Execution worker returned malformed response",
+                stack: null,
+              },
+              notes: [],
+            });
           });
 
           runner.addEventListener("error", () => {
-            clearTimeout(timeout);
-            runner.terminate();
-            URL.revokeObjectURL(runnerUrl);
-            reject(new Error("Execution worker crashed"));
+            finish({
+              ok: false,
+              exitCode: 70,
+              durationMs: 0,
+              returnType: "none",
+              returnValue: null,
+              argsType: args === null ? "null" : Array.isArray(args) ? "array" : typeof args,
+              logs: [],
+              output: {
+                text: "",
+                truncated: false,
+                bytes: 0,
+              },
+              error: {
+                message: "Execution worker crashed",
+                stack: null,
+              },
+              notes: [],
+            });
           });
 
-          runner.postMessage({ code, args });
+          runner.postMessage({
+            code,
+            args,
+            resultBudgetBytes,
+          });
         });
       }
 
@@ -380,9 +731,10 @@ self.onmessage = async (event) => {
         const verifiedTask = await verifySignedTask(jobId, payload.signedTask);
         appendLog(`running signed JS job ${jobId} timeout=${verifiedTask.timeoutMs}ms`);
 
-        const result = await executeScript(verifiedTask.code, verifiedTask.args, verifiedTask.timeoutMs);
+        const resultBudgetBytes = Math.max(4 * 1024, Math.floor(maxResultBytes * 0.9));
+        const result = await executeScript(verifiedTask.code, verifiedTask.args, verifiedTask.timeoutMs, resultBudgetBytes);
         send({ type: "result", workerId, jobId, result });
-        appendLog(`sent JS result for ${jobId}`);
+        appendLog(`sent JS result for ${jobId} exitCode=${result && result.exitCode !== undefined ? result.exitCode : "?"}`);
       }
 
       async function handleAssignMessage(message) {
