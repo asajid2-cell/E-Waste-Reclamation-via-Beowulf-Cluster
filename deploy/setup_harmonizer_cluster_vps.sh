@@ -286,13 +286,13 @@ cleanup_legacy_nginx_artifacts() {
   while IFS= read -r conf_file; do
     sed -i '\|include /etc/nginx/snippets/cluster-app.conf;|d' "${conf_file}"
     cleaned="1"
-  done < <(grep -RIl "include /etc/nginx/snippets/cluster-app.conf;" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null || true)
+  done < <(grep -RIl "include /etc/nginx/snippets/cluster-app.conf;" /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null || true)
 
   # Remove transient cluster-route snippet references from manual recovery attempts.
   while IFS= read -r conf_file; do
     sed -i '\|include /etc/nginx/snippets/cluster-route.conf;|d' "${conf_file}"
     cleaned="1"
-  done < <(grep -RIl "include /etc/nginx/snippets/cluster-route.conf;" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null || true)
+  done < <(grep -RIl "include /etc/nginx/snippets/cluster-route.conf;" /etc/nginx/sites-enabled /etc/nginx/sites-available /etc/nginx/conf.d 2>/dev/null || true)
 
   if [[ -f /etc/nginx/snippets/cluster-app.conf ]]; then
     rm -f /etc/nginx/snippets/cluster-app.conf
@@ -306,6 +306,19 @@ cleanup_legacy_nginx_artifacts() {
   if [[ "${cleaned}" == "1" ]]; then
     mark_note "Cleaned legacy nginx artifacts (.bak files and stale cluster snippet includes)."
   fi
+}
+
+dedupe_paths() {
+  local seen=""
+  local item
+  for item in "$@"; do
+    [[ -z "${item}" ]] && continue
+    if [[ "|${seen}|" == *"|${item}|"* ]]; then
+      continue
+    fi
+    printf '%s\n' "${item}"
+    seen="${seen}|${item}"
+  done
 }
 
 validate_signing_keypair() {
@@ -445,6 +458,84 @@ detect_host_nginx_site_conf() {
     return 1
   fi
   printf '%s' "${first}"
+}
+
+collect_active_tls_nginx_domain_confs() {
+  DOMAIN="${DOMAIN}" python3 - <<'PY'
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+domain = os.environ["DOMAIN"]
+try:
+    proc = subprocess.run(["nginx", "-T"], capture_output=True, text=True, check=False)
+except FileNotFoundError:
+    sys.exit(1)
+
+text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+if not text.strip():
+    sys.exit(1)
+
+marker_rx = re.compile(r"^# configuration file (.+):$")
+server_open_rx = re.compile(r"^\s*server\s*\{")
+server_name_rx = re.compile(r"^\s*server_name\b")
+listen_443_rx = re.compile(r"^\s*listen\s+[^;]*443")
+domain_rx = re.compile(r"\b" + re.escape(domain) + r"\b")
+
+files = {}
+order = []
+current_file = None
+for line in text.splitlines():
+    m = marker_rx.match(line)
+    if m:
+        current_file = m.group(1).strip()
+        if current_file not in files:
+            files[current_file] = []
+            order.append(current_file)
+        continue
+    if current_file is not None:
+        files[current_file].append(line)
+
+matches = []
+for file_path in order:
+    lines = files.get(file_path, [])
+    i = 0
+    found = False
+    while i < len(lines):
+        if server_open_rx.search(lines[i]):
+            depth = lines[i].count("{") - lines[i].count("}")
+            j = i + 1
+            has_domain = False
+            has_tls = False
+            while j < len(lines):
+                ln = lines[j]
+                if server_name_rx.search(ln) and domain_rx.search(ln):
+                    has_domain = True
+                if listen_443_rx.search(ln):
+                    has_tls = True
+                depth += ln.count("{")
+                depth -= ln.count("}")
+                if depth == 0:
+                    break
+                j += 1
+            if has_domain and has_tls:
+                found = True
+                break
+            i = j
+        i += 1
+    if found:
+        p = pathlib.Path(file_path)
+        matches.append(str(p.resolve()) if p.exists() else file_path)
+
+seen = set()
+for item in matches:
+    if item in seen:
+        continue
+    seen.add(item)
+    print(item)
+PY
 }
 
 ensure_nginx_include_in_domain_servers() {
@@ -1163,8 +1254,10 @@ EOF
 mark_done "Wrote systemd unit ${SERVICE_FILE}."
 
 systemctl daemon-reload
-systemctl enable --now "${SERVICE_NAME}"
-mark_done "Enabled and started systemd service ${SERVICE_NAME}."
+systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+systemctl restart "${SERVICE_NAME}"
+mark_done "Enabled and restarted systemd service ${SERVICE_NAME}."
+mark_note "Service ${SERVICE_NAME} was explicitly restarted to apply code and .env changes."
 
 effective_proxy_mode="${PROXY_MODE}"
 detected_host_nginx_conf="${NGINX_SITE_CONF}"
@@ -1176,6 +1269,16 @@ else
   detected_host_nginx_conf="$(realpath "${detected_host_nginx_conf}" 2>/dev/null || printf '%s' "${detected_host_nginx_conf}")"
   detected_host_nginx_confs=("${detected_host_nginx_conf}")
 fi
+
+# Prefer configs that nginx currently loads for this domain on TLS, not just guessed files.
+active_tls_nginx_domain_confs=()
+mapfile -t active_tls_nginx_domain_confs < <(collect_active_tls_nginx_domain_confs || true)
+if [[ "${#active_tls_nginx_domain_confs[@]}" -gt 0 ]]; then
+  mapfile -t detected_host_nginx_confs < <(dedupe_paths "${active_tls_nginx_domain_confs[@]}" "${detected_host_nginx_confs[@]}")
+  detected_host_nginx_conf="${detected_host_nginx_confs[0]:-${detected_host_nginx_conf}}"
+  mark_note "Active TLS nginx files for ${DOMAIN}: ${active_tls_nginx_domain_confs[*]}"
+fi
+
 tls_listener_owner="$(detect_tls_listener_owner || true)"
 if [[ -n "${tls_listener_owner}" ]]; then
   mark_note "Detected local :443 listener owner: ${tls_listener_owner}"
@@ -1351,6 +1454,21 @@ if curl -fsS "${HEALTH_URL}" >/dev/null; then
   mark_done "Local health check passed (${HEALTH_URL})."
 else
   mark_pending "Local health check failed (${HEALTH_URL})."
+fi
+
+AUTH_CHECK_URL="http://${APP_HOST}:${APP_PORT}${BASE_PATH}/api/auth/check"
+auth_check_ok="0"
+for _attempt in 1 2 3 4 5; do
+  if curl -fsS -H "Authorization: Bearer ${client_api_key}" "${AUTH_CHECK_URL}" >/dev/null; then
+    auth_check_ok="1"
+    break
+  fi
+  sleep 1
+done
+if [[ "${auth_check_ok}" == "1" ]]; then
+  mark_done "Local auth check passed with current CLIENT_API_KEY (${AUTH_CHECK_URL})."
+else
+  mark_pending "Local auth check failed with current CLIENT_API_KEY (${AUTH_CHECK_URL}); verify service restart/env loading."
 fi
 
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
