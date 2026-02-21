@@ -447,7 +447,7 @@ return { hits, samples: units };</textarea>
             </div>
             <div class="script-tip-block">
               <span>Auto mode: both shard fields empty = single; both filled = sharded.</span>
-              <span>Safety guard: system auto-increases units/shard to avoid excessive shard fan-out and WS spam.</span>
+              <span>Safety guard: your units/shard is respected; hard shard-count limits still apply.</span>
             </div>
           </div>
           <div class="script-options-row">
@@ -729,15 +729,13 @@ return hits;</pre>
         }
         const safety = computeShardSafety(totalUnits, workerCount);
         const currentUnits = Number(shardUnitsPerShardEl.value);
-        let changed = false;
-        if (!Number.isInteger(currentUnits) || currentUnits <= 0 || currentUnits < safety.recommendedUnits) {
-          shardUnitsPerShardEl.value = String(safety.recommendedUnits);
-          changed = true;
+        if (!Number.isInteger(currentUnits) || currentUnits <= 0) {
+          return null;
         }
-        const finalUnitsPerShard = Number(shardUnitsPerShardEl.value);
+        const finalUnitsPerShard = currentUnits;
         const resultingShards = Math.ceil(totalUnits / Math.max(finalUnitsPerShard, 1));
         return {
-          changed,
+          changed: false,
           workerCount,
           totalUnits,
           unitsPerShard: finalUnitsPerShard,
@@ -988,7 +986,6 @@ return hits;</pre>
         }
 
         if (executionModel === "sharded") {
-          const tuneInfo = autoTuneShardInputs();
           const totalUnits = Number(shardTotalUnitsEl.value);
           const unitsPerShard = Number(shardUnitsPerShardEl.value);
           if (!Number.isInteger(totalUnits) || totalUnits <= 0) {
@@ -1000,11 +997,6 @@ return hits;</pre>
             return;
           }
           body.shardConfig = { totalUnits, unitsPerShard };
-          if (tuneInfo && tuneInfo.changed) {
-            autoModeHintEl.textContent =
-              `Mode: auto sharded (units per shard auto-tuned to ${unitsPerShard} for stability)`;
-            autoModeHintEl.className = "hint mono ok";
-          }
 
           const reducerType = shardReducerEl.value;
           if (reducerType === "sum") {

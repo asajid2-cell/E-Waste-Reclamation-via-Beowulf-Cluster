@@ -463,19 +463,18 @@ app.post(withBasePath("/api/jobs/run-js"), auth.requireClientAuth, (req, res) =>
   } else if (parsed.value.executionModel === "sharded" && parsed.value.shardConfig) {
     const requestedUnitsPerShard = parsed.value.shardConfig.unitsPerShard;
     const safety = computeShardSafety(parsed.value.shardConfig.totalUnits, connectedWorkers);
-    const tunedUnitsPerShard = Math.max(requestedUnitsPerShard, safety.tunedUnitsPerShard);
-    const tunedTotalShards = Math.ceil(parsed.value.shardConfig.totalUnits / tunedUnitsPerShard);
-    if (tunedUnitsPerShard !== requestedUnitsPerShard) {
+    const requestedTotalShards = Math.ceil(parsed.value.shardConfig.totalUnits / requestedUnitsPerShard);
+    if (requestedTotalShards > safety.maxShardsAllowed) {
       executionNotes.push(
-        `unitsPerShard auto-tuned from ${requestedUnitsPerShard} to ${tunedUnitsPerShard} for stability (workers=${connectedWorkers}, maxShards=${safety.maxShardsAllowed}).`,
+        `High shard fan-out requested (${requestedTotalShards} shards); recommended soft cap is ${safety.maxShardsAllowed} for current worker count (${connectedWorkers}).`,
       );
     }
     createValue = {
       ...parsed.value,
       shardConfig: {
         totalUnits: parsed.value.shardConfig.totalUnits,
-        unitsPerShard: tunedUnitsPerShard,
-        totalShards: tunedTotalShards,
+        unitsPerShard: requestedUnitsPerShard,
+        totalShards: requestedTotalShards,
       },
     };
   }
