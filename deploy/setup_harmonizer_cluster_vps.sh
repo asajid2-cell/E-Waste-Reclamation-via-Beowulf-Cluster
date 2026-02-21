@@ -472,6 +472,7 @@ server_open_rx = re.compile(r"^\s*server\s*\{")
 server_name_rx = re.compile(r"^\s*server_name\b")
 location_exact_rx = re.compile(rf"^\s*location\s*=\s*{re.escape(base_path)}\s*\{{")
 location_prefix_rx = re.compile(rf"^\s*location\s+\^~\s+{re.escape(base_path)}/\s*\{{")
+location_any_cluster_rx = re.compile(rf"^\s*location\s+(?:=|\^~|~\*|~)?\s*{re.escape(base_path)}(?:/)?\s*\{{")
 
 blocks = []
 i = 0
@@ -498,7 +499,7 @@ def strip_cluster_locations(block_lines):
     i = 0
     while i < len(block_lines):
         line = block_lines[i]
-        if location_exact_rx.search(line) or location_prefix_rx.search(line):
+        if location_exact_rx.search(line) or location_prefix_rx.search(line) or location_any_cluster_rx.search(line):
             local_changed = True
             depth = line.count("{") - line.count("}")
             i += 1
