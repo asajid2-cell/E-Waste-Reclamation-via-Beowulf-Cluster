@@ -119,6 +119,11 @@ Use `pi-sharded.js` when you want cluster fan-out:
 If shard fields are left empty, run mode auto-resolves to `single`.
 For `run_js`, reducers read numeric fields from top-level result or `returnValue`.
 If sharded mode is requested but fewer than 2 workers are connected, server auto-runs the job as a single task.
+Shard settings are safety-tuned automatically to avoid tiny shards and excessive control-plane traffic:
+
+- minimum units per shard (`SHARD_MIN_UNITS`, default `100000`)
+- shard cap per worker (`SHARD_MAX_PER_WORKER`, default `200`)
+- absolute shard cap (`SHARD_ABSOLUTE_MAX`, default `50000`)
 
 Then compute `pi ~= 4 * (aggregate.hits / aggregate.samples)`.
 
@@ -255,6 +260,15 @@ Short invite tuning:
 - `SHORT_INVITE_CODE_LENGTH` (default `7`, min `4`, max `16`)
 - `SHORT_INVITE_MAX_ACTIVE` (default `50000`)
 - `WORKER_INVITE_PHRASE_WORDS` (default `8`, min `3`, max `8`)
+
+Rate/shard safety tuning:
+
+- `API_RATE_LIMIT_WINDOW_MS` (default `60000`)
+- `API_RATE_LIMIT_MAX` (default `1200`)
+- `WS_MAX_MESSAGES_PER_WINDOW` (default `1000`)
+- `SHARD_MIN_UNITS` (default `100000`)
+- `SHARD_MAX_PER_WORKER` (default `200`)
+- `SHARD_ABSOLUTE_MAX` (default `50000`)
 
 ## 8. Key Endpoints
 

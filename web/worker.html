@@ -1054,7 +1054,6 @@ self.onmessage = async (event) => {
           send({ type: "error", workerId, jobId, error: messageText });
         } finally {
           currentJobEl.textContent = "idle";
-          send({ type: "ready", workerId });
         }
       }
 

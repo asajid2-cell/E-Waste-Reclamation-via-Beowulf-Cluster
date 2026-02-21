@@ -23,16 +23,21 @@ const BASE_PATH_RAW = process.env.BASE_PATH || "";
 const MAX_INVALID_MESSAGES = 4;
 const WS_MAX_PAYLOAD = Number(process.env.WS_MAX_PAYLOAD || 256 * 1024);
 const WS_MAX_CONNECTIONS_PER_IP = Number(process.env.WS_MAX_CONNECTIONS_PER_IP || 20);
-const WS_MAX_MESSAGES_PER_WINDOW = Number(process.env.WS_MAX_MESSAGES_PER_WINDOW || 120);
+const WS_MAX_MESSAGES_PER_WINDOW = Number(process.env.WS_MAX_MESSAGES_PER_WINDOW || 1000);
 const WS_MESSAGE_WINDOW_MS = Number(process.env.WS_MESSAGE_WINDOW_MS || 10_000);
 const WS_HEARTBEAT_INTERVAL_MS = Math.max(Number(process.env.WS_HEARTBEAT_INTERVAL_MS || 25_000), 5_000);
 const WS_HEARTBEAT_TIMEOUT_MS = Math.max(Number(process.env.WS_HEARTBEAT_TIMEOUT_MS || 12_000), 2_000);
 const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || "128kb";
+const API_RATE_LIMIT_WINDOW_MS = Math.max(parsePositiveInt(process.env.API_RATE_LIMIT_WINDOW_MS, 60_000), 1000);
+const API_RATE_LIMIT_MAX = Math.max(parsePositiveInt(process.env.API_RATE_LIMIT_MAX, 1200), 1);
 const SHORT_INVITE_CODE_LENGTH = Math.min(Math.max(Number(process.env.SHORT_INVITE_CODE_LENGTH || 7), 4), 16);
 const SHORT_INVITE_MAX_ACTIVE = Math.min(Math.max(Number(process.env.SHORT_INVITE_MAX_ACTIVE || 50000), 100), 500000);
 const SHORT_INVITE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
 const WORKER_INVITE_PHRASE_WORDS = Math.min(Math.max(Number(process.env.WORKER_INVITE_PHRASE_WORDS || 8), 3), 8);
 const WORKER_INVITE_PHRASE_ALPHABET_SIZE = 2048;
+const SHARD_MIN_UNITS = Math.max(parsePositiveInt(process.env.SHARD_MIN_UNITS, 100000), 1);
+const SHARD_MAX_PER_WORKER = Math.max(parsePositiveInt(process.env.SHARD_MAX_PER_WORKER, 200), 1);
+const SHARD_ABSOLUTE_MAX = Math.max(parsePositiveInt(process.env.SHARD_ABSOLUTE_MAX, 50000), 100);
 
 function normalizeBasePath(input) {
   if (!input || input === "/") {
@@ -40,6 +45,25 @@ function normalizeBasePath(input) {
   }
   const withLeadingSlash = input.startsWith("/") ? input : `/${input}`;
   return withLeadingSlash.replace(/\/+$/, "");
+}
+
+function parsePositiveInt(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    return fallback;
+  }
+  return n;
+}
+
+function computeShardSafety(totalUnits, connectedWorkers) {
+  const effectiveWorkers = Math.max(Number(connectedWorkers) || 0, 2);
+  const maxShardsAllowed = Math.max(1, Math.min(SHARD_ABSOLUTE_MAX, effectiveWorkers * SHARD_MAX_PER_WORKER));
+  const tunedUnitsPerShard = Math.max(SHARD_MIN_UNITS, Math.ceil(totalUnits / maxShardsAllowed));
+  return {
+    maxShardsAllowed,
+    tunedUnitsPerShard,
+    tunedTotalShards: Math.ceil(totalUnits / tunedUnitsPerShard),
+  };
 }
 
 const BASE_PATH = normalizeBasePath(BASE_PATH_RAW);
@@ -189,10 +213,14 @@ app.use((req, res, next) => {
 });
 
 const apiLimiter = rateLimit({
-  windowMs: 60_000,
-  max: Number(process.env.API_RATE_LIMIT_MAX || 90),
+  windowMs: API_RATE_LIMIT_WINDOW_MS,
+  max: API_RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => {
+    const ip = req.ip || req.socket?.remoteAddress || "";
+    return ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+  },
   message: { error: "Too many requests. Slow down." },
 });
 
@@ -414,7 +442,7 @@ app.post(withBasePath("/api/jobs/run-js"), auth.requireClientAuth, (req, res) =>
 
   const connectedWorkers = store.listWorkers().length;
   let createValue = parsed.value;
-  let executionNote = null;
+  const executionNotes = [];
   if (parsed.value.executionModel === "sharded" && connectedWorkers < 2) {
     const fallbackArgs = {
       ...(parsed.value.args && typeof parsed.value.args === "object" && !Array.isArray(parsed.value.args)
@@ -431,7 +459,25 @@ app.post(withBasePath("/api/jobs/run-js"), auth.requireClientAuth, (req, res) =>
       shardConfig: null,
       reducer: null,
     };
-    executionNote = "Sharded execution auto-downgraded to single because fewer than 2 workers are connected.";
+    executionNotes.push("Sharded execution auto-downgraded to single because fewer than 2 workers are connected.");
+  } else if (parsed.value.executionModel === "sharded" && parsed.value.shardConfig) {
+    const requestedUnitsPerShard = parsed.value.shardConfig.unitsPerShard;
+    const safety = computeShardSafety(parsed.value.shardConfig.totalUnits, connectedWorkers);
+    const tunedUnitsPerShard = Math.max(requestedUnitsPerShard, safety.tunedUnitsPerShard);
+    const tunedTotalShards = Math.ceil(parsed.value.shardConfig.totalUnits / tunedUnitsPerShard);
+    if (tunedUnitsPerShard !== requestedUnitsPerShard) {
+      executionNotes.push(
+        `unitsPerShard auto-tuned from ${requestedUnitsPerShard} to ${tunedUnitsPerShard} for stability (workers=${connectedWorkers}, maxShards=${safety.maxShardsAllowed}).`,
+      );
+    }
+    createValue = {
+      ...parsed.value,
+      shardConfig: {
+        totalUnits: parsed.value.shardConfig.totalUnits,
+        unitsPerShard: tunedUnitsPerShard,
+        totalShards: tunedTotalShards,
+      },
+    };
   }
 
   const job = createValue.executionModel === "sharded" ? store.createShardedRunJsJob(createValue) : store.createJob(createValue);
@@ -440,7 +486,7 @@ app.post(withBasePath("/api/jobs/run-js"), auth.requireClientAuth, (req, res) =>
     jobId: job.jobId,
     status: job.status,
     executionModel: job.executionModel || "single",
-    note: executionNote,
+    note: executionNotes.length > 0 ? executionNotes.join(" ") : null,
   });
 });
 
@@ -572,7 +618,7 @@ wss.on("connection", (ws, req) => {
     ws.meta.lastPongAt = Date.now();
     ws.meta.messagesThisWindow += 1;
     if (ws.meta.messagesThisWindow > WS_MAX_MESSAGES_PER_WINDOW) {
-      ws.close(1008, "Rate limit exceeded");
+      ws.close(1013, "Rate limit exceeded");
       return;
     }
 

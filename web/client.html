@@ -410,7 +410,7 @@ return { hits, samples: units };</textarea>
             </div>
             <div class="script-tip-block">
               <span>Auto mode: both shard fields empty = single; both filled = sharded.</span>
-              <span>Recommended start: make 2-4 shards per active worker.</span>
+              <span>Safety guard: system auto-increases units/shard to avoid excessive shard fan-out and WS spam.</span>
             </div>
           </div>
           <div class="script-options-row">
@@ -510,6 +510,10 @@ return hits;</pre>
       const statusEl = document.getElementById("status");
       const resultEl = document.getElementById("result");
       const errorEl = document.getElementById("error");
+
+      const SHARD_MIN_UNITS = 100000;
+      const SHARD_MAX_PER_WORKER = 200;
+      const SHARD_ABSOLUTE_MAX = 50000;
 
       let currentJobId = null;
       let pollTimer = null;
@@ -655,6 +659,56 @@ return hits;</pre>
         return "invalid";
       }
 
+      function getConnectedWorkerCount() {
+        const workerCount = Number(workerCountEl.textContent);
+        if (!Number.isInteger(workerCount) || workerCount < 0) {
+          return null;
+        }
+        return workerCount;
+      }
+
+      function computeShardSafety(totalUnits, workerCount) {
+        const effectiveWorkers = Math.max(workerCount || 2, 2);
+        const maxShardsAllowed = Math.max(1, Math.min(SHARD_ABSOLUTE_MAX, effectiveWorkers * SHARD_MAX_PER_WORKER));
+        const recommendedUnits = Math.max(SHARD_MIN_UNITS, Math.ceil(totalUnits / maxShardsAllowed));
+        return { maxShardsAllowed, recommendedUnits };
+      }
+
+      function autoTuneShardInputs() {
+        if (detectExecutionModelFromInputs() !== "sharded") {
+          return null;
+        }
+        const totalUnits = Number(shardTotalUnitsEl.value);
+        if (!Number.isInteger(totalUnits) || totalUnits <= 0) {
+          return null;
+        }
+        const workerCount = getConnectedWorkerCount();
+        if (workerCount !== null && workerCount < 2) {
+          return {
+            changed: false,
+            workerCount,
+            skippedForSingleFallback: true,
+          };
+        }
+        const safety = computeShardSafety(totalUnits, workerCount);
+        const currentUnits = Number(shardUnitsPerShardEl.value);
+        let changed = false;
+        if (!Number.isInteger(currentUnits) || currentUnits <= 0 || currentUnits < safety.recommendedUnits) {
+          shardUnitsPerShardEl.value = String(safety.recommendedUnits);
+          changed = true;
+        }
+        const finalUnitsPerShard = Number(shardUnitsPerShardEl.value);
+        const resultingShards = Math.ceil(totalUnits / Math.max(finalUnitsPerShard, 1));
+        return {
+          changed,
+          workerCount,
+          totalUnits,
+          unitsPerShard: finalUnitsPerShard,
+          resultingShards,
+          maxShardsAllowed: safety.maxShardsAllowed,
+        };
+      }
+
       function refreshReducerUi() {
         if (shardReducerEl.disabled) {
           shardSumFieldsEl.disabled = true;
@@ -676,8 +730,7 @@ return hits;</pre>
 
       function refreshAutoModeUi() {
         const model = detectExecutionModelFromInputs();
-        const workerCount = Number(workerCountEl.textContent);
-        const hasWorkerCount = Number.isInteger(workerCount);
+        const workerCount = getConnectedWorkerCount();
         if (model === "single") {
           autoModeHintEl.textContent = "Mode: auto single (default)";
           autoModeHintEl.className = "hint mono";
@@ -686,12 +739,17 @@ return hits;</pre>
           return;
         }
         if (model === "sharded") {
-          if (hasWorkerCount && workerCount < 2) {
+          if (workerCount !== null && workerCount < 2) {
             autoModeHintEl.textContent =
               "Mode: auto sharded requested, but server will run single until at least 2 workers are connected";
             autoModeHintEl.className = "hint mono warn-text";
           } else {
-            autoModeHintEl.textContent = "Mode: auto sharded (cluster fan-out enabled)";
+            const tuneInfo = autoTuneShardInputs();
+            const tunedMessage =
+              tuneInfo && Number.isInteger(tuneInfo.resultingShards)
+                ? `Mode: auto sharded (cluster fan-out enabled, ${tuneInfo.resultingShards} shard(s))`
+                : "Mode: auto sharded (cluster fan-out enabled)";
+            autoModeHintEl.textContent = tunedMessage;
             autoModeHintEl.className = "hint mono ok";
           }
           shardReducerEl.disabled = false;
@@ -893,6 +951,7 @@ return hits;</pre>
         }
 
         if (executionModel === "sharded") {
+          const tuneInfo = autoTuneShardInputs();
           const totalUnits = Number(shardTotalUnitsEl.value);
           const unitsPerShard = Number(shardUnitsPerShardEl.value);
           if (!Number.isInteger(totalUnits) || totalUnits <= 0) {
@@ -904,6 +963,11 @@ return hits;</pre>
             return;
           }
           body.shardConfig = { totalUnits, unitsPerShard };
+          if (tuneInfo && tuneInfo.changed) {
+            autoModeHintEl.textContent =
+              `Mode: auto sharded (units per shard auto-tuned to ${unitsPerShard} for stability)`;
+            autoModeHintEl.className = "hint mono ok";
+          }
 
           const reducerType = shardReducerEl.value;
           if (reducerType === "sum") {
