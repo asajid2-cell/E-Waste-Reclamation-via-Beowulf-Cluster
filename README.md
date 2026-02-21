@@ -128,7 +128,9 @@ What it does:
 - creates a Python virtualenv (`APP_DIR/.venv`) and upgrades pip tooling
 - installs production dependencies (`npm ci --omit=dev`)
 - creates and enables `systemd` service (`cluster-app`)
-- adds nginx location routing for `harmonizer.cc/cluster` without replacing root site
+- auto-detects proxy mode:
+  - host nginx config in `/etc/nginx/...`, or
+  - docker proxy container (`caddy`/`nginx`) and patches mounted config
 - reloads nginx and runs health checks
 - writes a deployment status report to `APP_DIR/deploy-status.txt`
 
@@ -138,8 +140,15 @@ Useful flags:
 sudo bash deploy/setup_harmonizer_cluster_vps.sh \
   --source-mode local \
   --source-dir /root/your-clone \
+  --proxy-mode auto \
   --domain harmonizer.cc \
   --base-path /cluster
+```
+
+If auto-detection picks the wrong proxy container, pass it explicitly:
+
+```bash
+sudo bash deploy/setup_harmonizer_cluster_vps.sh --proxy-mode docker-proxy --docker-proxy-container <container_name>
 ```
 
 ## 6. Security Controls Included

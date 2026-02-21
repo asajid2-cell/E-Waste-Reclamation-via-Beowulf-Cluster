@@ -54,6 +54,8 @@ Options:
   --source-dir DIR             Local repo directory to deploy from (default: script parent dir)
   --repo-url URL               Git repository URL when source-mode=remote
   --repo-branch BRANCH         Git branch to deploy when source-mode=remote (default: light)
+  --proxy-mode MODE            auto|host-nginx|docker-proxy (default: auto)
+  --docker-proxy-container N   Optional docker proxy container name override
   --service-name NAME          systemd service name (default: cluster-app)
   --app-port PORT              Local app port behind nginx (default: 18080)
   --app-host HOST              Bind host for app service (default: 127.0.0.1)
@@ -78,6 +80,9 @@ SOURCE_MODE="auto"
 SOURCE_DIR="${DEFAULT_SOURCE_DIR}"
 REPO_URL="https://github.com/asajid2-cell/E-Waste-Reclamation-via-Beowulf-Cluster.git"
 REPO_BRANCH="light"
+PROXY_MODE="auto"
+DOCKER_PROXY_CONTAINER=""
+DOCKER_PROXY_TYPE=""
 SERVICE_NAME="cluster-app"
 APP_PORT="18080"
 APP_HOST="127.0.0.1"
@@ -123,6 +128,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --repo-branch)
       REPO_BRANCH="${2:?missing value}"
+      shift 2
+      ;;
+    --proxy-mode)
+      PROXY_MODE="${2:?missing value}"
+      shift 2
+      ;;
+    --docker-proxy-container)
+      DOCKER_PROXY_CONTAINER="${2:?missing value}"
       shift 2
       ;;
     --service-name)
@@ -184,6 +197,10 @@ if [[ ! "${SOURCE_MODE}" =~ ^(auto|local|remote)$ ]]; then
   fail "--source-mode must be one of: auto, local, remote"
 fi
 
+if [[ ! "${PROXY_MODE}" =~ ^(auto|host-nginx|docker-proxy)$ ]]; then
+  fail "--proxy-mode must be one of: auto, host-nginx, docker-proxy"
+fi
+
 if [[ "${SOURCE_MODE}" == "auto" ]]; then
   if [[ -d "${SOURCE_DIR}/.git" && -f "${SOURCE_DIR}/package.json" ]]; then
     SOURCE_MODE="local"
@@ -223,6 +240,316 @@ run_as_app() {
   runuser -u "${APP_USER}" -- bash -lc "$*"
 }
 
+detect_host_nginx_site_conf() {
+  local domain_regex
+  domain_regex="$(escape_regex "${DOMAIN}")"
+  local nginx_candidates=()
+  mapfile -t nginx_candidates < <(grep -RlsE "server_name[[:space:]].*${domain_regex}" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null || true)
+  if [[ "${#nginx_candidates[@]}" -eq 0 ]]; then
+    return 1
+  fi
+  printf '%s' "${nginx_candidates[0]}"
+}
+
+infer_proxy_type_from_image() {
+  local image_lc
+  image_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${image_lc}" == *caddy* ]]; then
+    printf '%s' "caddy"
+    return 0
+  fi
+  if [[ "${image_lc}" == *nginx* ]]; then
+    printf '%s' "nginx"
+    return 0
+  fi
+  return 1
+}
+
+detect_docker_proxy_container() {
+  if ! command -v docker >/dev/null 2>&1; then
+    return 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if [[ -n "${DOCKER_PROXY_CONTAINER}" ]]; then
+    if ! docker ps --format '{{.Names}}' | grep -Fxq "${DOCKER_PROXY_CONTAINER}"; then
+      fail "Specified --docker-proxy-container '${DOCKER_PROXY_CONTAINER}' is not running."
+    fi
+    local image
+    image="$(docker inspect --format '{{.Config.Image}}' "${DOCKER_PROXY_CONTAINER}")"
+    DOCKER_PROXY_TYPE="$(infer_proxy_type_from_image "${image}" || true)"
+    if [[ -z "${DOCKER_PROXY_TYPE}" ]]; then
+      fail "Unsupported docker proxy image: ${image}"
+    fi
+    return 0
+  fi
+
+  local lines=()
+  local line
+  mapfile -t lines < <(docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}')
+
+  for line in "${lines[@]}"; do
+    IFS='|' read -r name image ports <<<"${line}"
+    if [[ "${ports}" != *":80->"* && "${ports}" != *":443->"* ]]; then
+      continue
+    fi
+    local proxy_type
+    proxy_type="$(infer_proxy_type_from_image "${image}" || true)"
+    if [[ -z "${proxy_type}" ]]; then
+      continue
+    fi
+    DOCKER_PROXY_CONTAINER="${name}"
+    DOCKER_PROXY_TYPE="${proxy_type}"
+    return 0
+  done
+
+  return 1
+}
+
+get_container_network_gateway() {
+  local container_name="$1"
+  local network_name
+  network_name="$(docker inspect --format '{{range $k,$v := .NetworkSettings.Networks}}{{printf "%s\n" $k}}{{break}}{{end}}' "${container_name}" 2>/dev/null || true)"
+  if [[ -z "${network_name}" ]]; then
+    return 1
+  fi
+  local gateway
+  gateway="$(docker network inspect "${network_name}" --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+  if [[ -n "${gateway}" ]]; then
+    printf '%s' "${gateway}"
+    return 0
+  fi
+  return 1
+}
+
+locate_caddyfile_for_container() {
+  local container_name="$1"
+  local line source dest
+  while IFS= read -r line; do
+    source="${line%%|*}"
+    dest="${line##*|}"
+    if [[ "${dest}" == "/etc/caddy/Caddyfile" && -f "${source}" ]]; then
+      printf '%s' "${source}"
+      return 0
+    fi
+    if [[ "${dest}" == "/etc/caddy" && -f "${source}/Caddyfile" ]]; then
+      printf '%s' "${source}/Caddyfile"
+      return 0
+    fi
+  done < <(docker inspect --format '{{range .Mounts}}{{println .Source "|" .Destination}}{{end}}' "${container_name}")
+  return 1
+}
+
+locate_nginx_conf_for_container() {
+  local container_name="$1"
+  local domain_regex
+  domain_regex="$(escape_regex "${DOMAIN}")"
+  local line source dest
+  while IFS= read -r line; do
+    source="${line%%|*}"
+    dest="${line##*|}"
+    if [[ "${dest}" != /etc/nginx* ]]; then
+      continue
+    fi
+    if [[ -f "${source}" ]]; then
+      if grep -qE "server_name[[:space:]].*${domain_regex}" "${source}"; then
+        printf '%s' "${source}"
+        return 0
+      fi
+      continue
+    fi
+    if [[ -d "${source}" ]]; then
+      local candidate
+      candidate="$(grep -RlsE "server_name[[:space:]].*${domain_regex}" "${source}" 2>/dev/null | head -n1 || true)"
+      if [[ -n "${candidate}" ]]; then
+        printf '%s' "${candidate}"
+        return 0
+      fi
+    fi
+  done < <(docker inspect --format '{{range .Mounts}}{{println .Source "|" .Destination}}{{end}}' "${container_name}")
+  return 1
+}
+
+patch_caddy_for_cluster() {
+  local caddyfile_path="$1"
+  local upstream="$2"
+  DOMAIN="${DOMAIN}" BASE_PATH="${BASE_PATH}" UPSTREAM="${upstream}" CADDYFILE_PATH="${caddyfile_path}" python3 - <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(os.environ["CADDYFILE_PATH"])
+domain = os.environ["DOMAIN"]
+base_path = os.environ["BASE_PATH"]
+upstream = os.environ["UPSTREAM"]
+
+if not path.exists():
+    print(f"Caddyfile not found: {path}", file=sys.stderr)
+    sys.exit(2)
+
+lines = path.read_text(encoding="utf-8").splitlines()
+if any(f"path {base_path} {base_path}/*" in ln for ln in lines):
+    sys.exit(0)
+
+start = None
+for i, line in enumerate(lines):
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        continue
+    if "{" in stripped and domain in stripped:
+        start = i
+        break
+
+if start is None:
+    print(f"Domain block not found for {domain} in {path}", file=sys.stderr)
+    sys.exit(3)
+
+indent = re.match(r"^(\s*)", lines[start]).group(1) + "    "
+insert = [
+    f"{indent}# cluster route {base_path}",
+    f"{indent}@cluster_route path {base_path} {base_path}/*",
+    f"{indent}handle @cluster_route {{",
+    f"{indent}    reverse_proxy {upstream}",
+    f"{indent}}}",
+]
+
+out = lines[:start + 1] + insert + lines[start + 1:]
+backup = path.with_suffix(path.suffix + ".bak")
+backup.write_text("\n".join(lines) + "\n", encoding="utf-8")
+path.write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
+}
+
+patch_nginx_for_cluster() {
+  local nginx_conf_path="$1"
+  local upstream="$2"
+  DOMAIN="${DOMAIN}" BASE_PATH="${BASE_PATH}" UPSTREAM="${upstream}" NGINX_CONF_PATH="${nginx_conf_path}" python3 - <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(os.environ["NGINX_CONF_PATH"])
+domain = os.environ["DOMAIN"]
+base_path = os.environ["BASE_PATH"]
+upstream = os.environ["UPSTREAM"]
+
+if not path.exists():
+    print(f"Nginx conf not found: {path}", file=sys.stderr)
+    sys.exit(2)
+
+lines = path.read_text(encoding="utf-8").splitlines()
+server_start = None
+server_end = None
+i = 0
+while i < len(lines):
+    if re.search(r"^\s*server\s*\{", lines[i]):
+        depth = lines[i].count("{") - lines[i].count("}")
+        domain_hit = False
+        j = i + 1
+        while j < len(lines):
+            if re.search(r"^\s*server_name\b", lines[j]) and domain in lines[j]:
+                domain_hit = True
+            depth += lines[j].count("{")
+            depth -= lines[j].count("}")
+            if depth == 0:
+                if domain_hit:
+                    server_start = i
+                    server_end = j
+                    break
+                i = j
+                break
+            j += 1
+        if server_start is not None:
+            break
+    i += 1
+
+if server_start is None or server_end is None:
+    print(f"server_name for {domain} not found in {path}", file=sys.stderr)
+    sys.exit(3)
+
+block_text = "\n".join(lines[server_start:server_end + 1])
+if f"location ^~ {base_path}/" in block_text:
+    sys.exit(0)
+
+closing_indent = re.match(r"^(\s*)", lines[server_end]).group(1)
+indent = closing_indent + "    "
+insert = [
+    f"{indent}# cluster route {base_path}",
+    f"{indent}location = {base_path} {{",
+    f"{indent}    return 302 {base_path}/client;",
+    f"{indent}}}",
+    f"{indent}location ^~ {base_path}/ {{",
+    f"{indent}    proxy_pass http://{upstream};",
+    f"{indent}    proxy_http_version 1.1;",
+    f"{indent}    proxy_set_header Host $host;",
+    f"{indent}    proxy_set_header X-Real-IP $remote_addr;",
+    f"{indent}    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+    f"{indent}    proxy_set_header X-Forwarded-Proto $scheme;",
+    f"{indent}    proxy_set_header Upgrade $http_upgrade;",
+    f"{indent}    proxy_set_header Connection \"upgrade\";",
+    f"{indent}    proxy_read_timeout 300s;",
+    f"{indent}    proxy_send_timeout 300s;",
+    f"{indent}}}",
+]
+
+out = lines[:server_end] + insert + [lines[server_end]] + lines[server_end + 1:]
+backup = path.with_suffix(path.suffix + ".bak")
+backup.write_text("\n".join(lines) + "\n", encoding="utf-8")
+path.write_text("\n".join(out) + "\n", encoding="utf-8")
+PY
+}
+
+configure_docker_proxy_route() {
+  if ! detect_docker_proxy_container; then
+    fail "Could not find docker proxy container automatically. Pass --docker-proxy-container."
+  fi
+
+  local gateway_ip
+  gateway_ip="$(get_container_network_gateway "${DOCKER_PROXY_CONTAINER}" || true)"
+  if [[ -z "${gateway_ip}" ]]; then
+    gateway_ip="$(ip -4 addr show docker0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 || true)"
+  fi
+  if [[ -z "${gateway_ip}" ]]; then
+    gateway_ip="127.0.0.1"
+    mark_note "Docker gateway not detected; falling back to 127.0.0.1 upstream for proxy container."
+  fi
+  local upstream="${gateway_ip}:${APP_PORT}"
+  mark_done "Using docker proxy container ${DOCKER_PROXY_CONTAINER} (${DOCKER_PROXY_TYPE}) -> upstream ${upstream}."
+
+  if [[ "${DOCKER_PROXY_TYPE}" == "caddy" ]]; then
+    local caddyfile_path
+    caddyfile_path="$(locate_caddyfile_for_container "${DOCKER_PROXY_CONTAINER}" || true)"
+    if [[ -z "${caddyfile_path}" ]]; then
+      fail "Could not locate Caddyfile for container ${DOCKER_PROXY_CONTAINER}."
+    fi
+    patch_caddy_for_cluster "${caddyfile_path}" "${upstream}"
+    if ! docker exec "${DOCKER_PROXY_CONTAINER}" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+      docker restart "${DOCKER_PROXY_CONTAINER}" >/dev/null
+    fi
+    mark_done "Patched caddy config at ${caddyfile_path} and reloaded ${DOCKER_PROXY_CONTAINER}."
+    return
+  fi
+
+  if [[ "${DOCKER_PROXY_TYPE}" == "nginx" ]]; then
+    local nginx_conf_path
+    nginx_conf_path="$(locate_nginx_conf_for_container "${DOCKER_PROXY_CONTAINER}" || true)"
+    if [[ -z "${nginx_conf_path}" ]]; then
+      fail "Could not locate nginx config for ${DOMAIN} inside ${DOCKER_PROXY_CONTAINER} mounts."
+    fi
+    patch_nginx_for_cluster "${nginx_conf_path}" "${upstream}"
+    docker exec "${DOCKER_PROXY_CONTAINER}" nginx -t >/dev/null
+    docker exec "${DOCKER_PROXY_CONTAINER}" nginx -s reload >/dev/null
+    mark_done "Patched nginx config at ${nginx_conf_path} and reloaded ${DOCKER_PROXY_CONTAINER}."
+    return
+  fi
+
+  fail "Unsupported docker proxy type '${DOCKER_PROXY_TYPE}'."
+}
+
 log "Installing base packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
@@ -237,8 +564,17 @@ apt-get install -y --no-install-recommends \
   rsync \
   python3 \
   python3-venv \
-  python3-pip
-mark_done "Installed system packages (nginx, ufw, openssl, rsync, python3, python3-venv, python3-pip)."
+  python3-pip \
+  docker.io \
+  docker-compose-plugin
+mark_done "Installed system packages (nginx, ufw, openssl, rsync, python3, docker, docker compose)."
+
+systemctl enable --now docker >/dev/null 2>&1 || true
+if docker info >/dev/null 2>&1; then
+  mark_done "Docker daemon is available."
+else
+  mark_pending "Docker daemon is not reachable right now."
+fi
 
 if [[ "${INSTALL_FAIL2BAN}" == "1" ]]; then
   apt-get install -y --no-install-recommends fail2ban
@@ -436,23 +772,34 @@ systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}"
 mark_done "Enabled and started systemd service ${SERVICE_NAME}."
 
-if [[ -z "${NGINX_SITE_CONF}" ]]; then
-  domain_regex="$(escape_regex "${DOMAIN}")"
-  mapfile -t nginx_candidates < <(grep -RlsE "server_name[[:space:]].*${domain_regex}" /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null || true)
-  if [[ "${#nginx_candidates[@]}" -eq 0 ]]; then
-    fail "Could not find nginx site config with server_name ${DOMAIN}. Pass --nginx-site-conf."
+effective_proxy_mode="${PROXY_MODE}"
+detected_host_nginx_conf="${NGINX_SITE_CONF}"
+if [[ -z "${detected_host_nginx_conf}" ]]; then
+  detected_host_nginx_conf="$(detect_host_nginx_site_conf || true)"
+fi
+
+if [[ "${effective_proxy_mode}" == "auto" ]]; then
+  if [[ -n "${detected_host_nginx_conf}" ]]; then
+    effective_proxy_mode="host-nginx"
+  else
+    effective_proxy_mode="docker-proxy"
   fi
-  NGINX_SITE_CONF="${nginx_candidates[0]}"
 fi
+mark_done "Proxy mode selected: ${effective_proxy_mode}."
 
-if [[ ! -f "${NGINX_SITE_CONF}" ]]; then
-  fail "Nginx site config not found: ${NGINX_SITE_CONF}"
-fi
+if [[ "${effective_proxy_mode}" == "host-nginx" ]]; then
+  NGINX_SITE_CONF="${detected_host_nginx_conf}"
+  if [[ -z "${NGINX_SITE_CONF}" ]]; then
+    fail "Could not find nginx site config with server_name ${DOMAIN}. Use --proxy-mode docker-proxy or pass --nginx-site-conf."
+  fi
+  if [[ ! -f "${NGINX_SITE_CONF}" ]]; then
+    fail "Nginx site config not found: ${NGINX_SITE_CONF}"
+  fi
 
-NGINX_SNIPPET="/etc/nginx/snippets/${SERVICE_NAME}.conf"
-log "Writing nginx location snippet ${NGINX_SNIPPET}"
-install -d /etc/nginx/snippets
-cat > "${NGINX_SNIPPET}" <<EOF
+  NGINX_SNIPPET="/etc/nginx/snippets/${SERVICE_NAME}.conf"
+  log "Writing nginx location snippet ${NGINX_SNIPPET}"
+  install -d /etc/nginx/snippets
+  cat > "${NGINX_SNIPPET}" <<EOF
 # Managed by ${SERVICE_NAME} setup script
 location = ${BASE_PATH} {
     return 302 ${BASE_PATH}/client;
@@ -471,23 +818,26 @@ location ^~ ${BASE_PATH}/ {
     proxy_send_timeout 300s;
 }
 EOF
-mark_done "Wrote nginx snippet ${NGINX_SNIPPET}."
+  mark_done "Wrote nginx snippet ${NGINX_SNIPPET}."
 
-include_line="include ${NGINX_SNIPPET};"
-if ! grep -Fq "${include_line}" "${NGINX_SITE_CONF}"; then
-  log "Injecting nginx include into ${NGINX_SITE_CONF}"
-  cp "${NGINX_SITE_CONF}" "${NGINX_SITE_CONF}.bak.$(date +%Y%m%d%H%M%S)"
-  domain_regex="$(escape_regex "${DOMAIN}")"
-  sed -i "/server_name[[:space:]].*${domain_regex}/a\\    ${include_line}" "${NGINX_SITE_CONF}"
-  mark_done "Injected nginx include into ${NGINX_SITE_CONF}."
+  include_line="include ${NGINX_SNIPPET};"
+  if ! grep -Fq "${include_line}" "${NGINX_SITE_CONF}"; then
+    log "Injecting nginx include into ${NGINX_SITE_CONF}"
+    cp "${NGINX_SITE_CONF}" "${NGINX_SITE_CONF}.bak.$(date +%Y%m%d%H%M%S)"
+    domain_regex="$(escape_regex "${DOMAIN}")"
+    sed -i "/server_name[[:space:]].*${domain_regex}/a\\    ${include_line}" "${NGINX_SITE_CONF}"
+    mark_done "Injected nginx include into ${NGINX_SITE_CONF}."
+  else
+    mark_done "Nginx include already present in ${NGINX_SITE_CONF}."
+  fi
+
+  log "Testing and reloading nginx"
+  nginx -t
+  systemctl reload nginx
+  mark_done "nginx config test and reload succeeded."
 else
-  mark_done "Nginx include already present in ${NGINX_SITE_CONF}."
+  configure_docker_proxy_route
 fi
-
-log "Testing and reloading nginx"
-nginx -t
-systemctl reload nginx
-mark_done "nginx config test and reload succeeded."
 
 if [[ "${INSTALL_FAIL2BAN}" == "1" ]]; then
   systemctl enable --now fail2ban
@@ -545,6 +895,11 @@ REPORT_FILE="${APP_DIR}/deploy-status.txt"
   echo "App Dir: ${APP_DIR}"
   echo "Service: ${SERVICE_NAME}"
   echo "Source Mode: ${SOURCE_MODE}"
+  echo "Proxy Mode: ${effective_proxy_mode}"
+  if [[ -n "${DOCKER_PROXY_CONTAINER}" ]]; then
+    echo "Docker Proxy Container: ${DOCKER_PROXY_CONTAINER}"
+    echo "Docker Proxy Type: ${DOCKER_PROXY_TYPE}"
+  fi
   echo
   echo "Completed:"
   for item in "${COMPLETED_STEPS[@]}"; do
