@@ -1,0 +1,173 @@
+{
+  "pi": {
+    "description": "Monte Carlo Pi estimation.",
+    "totalUnits": 40000000,
+    "unitsPerShard": 400000,
+    "timeoutMs": 240000,
+    "args": {
+      "benchmark": "pi",
+      "seed": 1337
+    },
+    "reducer": {
+      "type": "sum",
+      "fields": ["hits", "samples", "ops"]
+    }
+  },
+  "mandelbrot": {
+    "description": "Mandelbrot escape-time workload.",
+    "totalUnits": 8000000,
+    "unitsPerShard": 80000,
+    "timeoutMs": 300000,
+    "args": {
+      "benchmark": "mandelbrot",
+      "width": 2560,
+      "height": 1440,
+      "maxIter": 1600,
+      "zoom": 1
+    },
+    "reducer": {
+      "type": "sum",
+      "fields": ["sumIter", "escaped", "samples", "ops"]
+    }
+  },
+  "sha256_pow": {
+    "description": "Distributed SHA-256 nonce scan.",
+    "totalUnits": 500000,
+    "unitsPerShard": 10000,
+    "timeoutMs": 360000,
+    "args": {
+      "benchmark": "sha256_pow",
+      "prefix": "harmonizer-bench",
+      "targetZeroBits": 16,
+      "roundsPerUnit": 2
+    },
+    "reducer": {
+      "type": "sum",
+      "fields": ["hashes", "found", "samples", "ops"]
+    }
+  },
+  "mosaic": {
+    "description": "Image-mosaic nearest-color matching.",
+    "totalUnits": 6000000,
+    "unitsPerShard": 100000,
+    "timeoutMs": 300000,
+    "args": {
+      "benchmark": "mosaic",
+      "paletteSize": 768,
+      "seed": 777
+    },
+    "reducer": {
+      "type": "sum",
+      "fields": ["score", "checksum", "samples", "ops"]
+    }
+  },
+  "primes": {
+    "description": "Segmented primality counting.",
+    "totalUnits": 1800000,
+    "unitsPerShard": 40000,
+    "timeoutMs": 300000,
+    "args": {
+      "benchmark": "primes",
+      "startBase": 4000001,
+      "skipEven": true
+    },
+    "reducer": {
+      "type": "sum",
+      "fields": ["primeCount", "checks", "checksum", "samples", "ops"]
+    }
+  },
+  "matrix": {
+    "description": "Dense matrix multiply/mix loop.",
+    "totalUnits": 12000,
+    "unitsPerShard": 300,
+    "timeoutMs": 360000,
+    "args": {
+      "benchmark": "matrix",
+      "size": 44,
+      "roundsPerUnit": 2,
+      "seed": 4242
+    },
+    "reducer": {
+      "type": "sum",
+      "fields": ["sum", "checksum", "samples", "ops"]
+    }
+  },
+  "nbody": {
+    "description": "N-body gravity step simulation.",
+    "totalUnits": 30000,
+    "unitsPerShard": 600,
+    "timeoutMs": 360000,
+    "args": {
+      "benchmark": "nbody",
+      "particles": 72,
+      "stepsPerUnit": 1,
+      "dt": 0.0006,
+      "softening": 0.001,
+      "seed": 9091
+    },
+    "reducer": {
+      "type": "sum",
+      "fields": ["energy", "checksum", "samples", "ops"]
+    }
+  },
+  "sobel": {
+    "description": "Sobel edge convolution over image field.",
+    "totalUnits": 12000000,
+    "unitsPerShard": 200000,
+    "timeoutMs": 300000,
+    "args": {
+      "benchmark": "sobel",
+      "width": 384,
+      "height": 384,
+      "seed": 5150
+    },
+    "reducer": {
+      "type": "sum",
+      "fields": ["edgeSum", "checksum", "samples", "ops"]
+    }
+  },
+  "sort": {
+    "description": "Batch numeric sort stress test.",
+    "totalUnits": 12000,
+    "unitsPerShard": 250,
+    "timeoutMs": 360000,
+    "args": {
+      "benchmark": "sort",
+      "length": 2048,
+      "seed": 6060
+    },
+    "reducer": {
+      "type": "sum",
+      "fields": ["checksum", "samples", "ops"]
+    }
+  },
+  "levenshtein": {
+    "description": "Edit-distance dynamic-programming batches.",
+    "totalUnits": 180000,
+    "unitsPerShard": 4000,
+    "timeoutMs": 300000,
+    "args": {
+      "benchmark": "levenshtein",
+      "lenA": 84,
+      "lenB": 84,
+      "seed": 8080
+    },
+    "reducer": {
+      "type": "sum",
+      "fields": ["distanceSum", "checksum", "samples", "ops"]
+    }
+  },
+  "suite": {
+    "description": "Runs all benchmark families in one submission.",
+    "totalUnits": 90000000,
+    "unitsPerShard": 900000,
+    "timeoutMs": 600000,
+    "args": {
+      "benchmark": "suite"
+    },
+    "reducer": {
+      "type": "sum",
+      "fields": ["*"]
+    }
+  }
+}

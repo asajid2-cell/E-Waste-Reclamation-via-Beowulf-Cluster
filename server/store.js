@@ -25,6 +25,9 @@ function initializeReducerAggregate(reducer) {
   if (reducer.type === "sum") {
     const aggregate = {};
     for (const field of reducer.fields || []) {
+      if (field === "*") {
+        continue;
+      }
       aggregate[field] = 0;
     }
     return aggregate;
@@ -56,7 +59,22 @@ function applyReducerResult(reducer, aggregate, shardResult) {
       !Array.isArray(shardResult.returnValue)
         ? shardResult.returnValue
         : null;
-    for (const field of reducer.fields || []) {
+    const fields = Array.isArray(reducer.fields) ? reducer.fields : [];
+    const wildcardMode = fields.includes("*");
+
+    if (wildcardMode) {
+      const source = envelopeReturn || shardResult;
+      for (const [field, rawValue] of Object.entries(source)) {
+        const value = Number(rawValue);
+        if (!Number.isFinite(value)) {
+          continue;
+        }
+        aggregate[field] = (aggregate[field] || 0) + value;
+      }
+      return;
+    }
+
+    for (const field of fields) {
       let rawValue = shardResult[field];
       if (!Number.isFinite(Number(rawValue)) && envelopeReturn) {
         rawValue = envelopeReturn[field];

@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Cluster Secure Client</title>
     <style>
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
       :root {
         --bg: #0a1128;
         --card: #1b263b;
@@ -26,6 +31,7 @@
         max-width: 860px;
         margin: 2rem auto;
         padding: 1rem;
+        width: 100%;
       }
       .card {
         background: color-mix(in srgb, var(--card) 90%, black);
@@ -33,6 +39,7 @@
         border-radius: 12px;
         padding: 1rem;
         margin-bottom: 1rem;
+        width: 100%;
       }
       h1 {
         margin: 0 0 0.3rem 0;
@@ -44,8 +51,9 @@
       }
       .row {
         display: grid;
-        grid-template-columns: 1fr auto;
+        grid-template-columns: minmax(0, 1fr) auto;
         gap: 0.5rem;
+        width: 100%;
       }
       .stack {
         display: grid;
@@ -53,18 +61,21 @@
       }
       form {
         display: grid;
-        grid-template-columns: 1fr 1fr auto;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
         gap: 0.6rem;
+        width: 100%;
       }
       .custom-form {
         display: grid;
         gap: 0.6rem;
+        width: 100%;
       }
       .script-options-row {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) 180px minmax(0, 1fr);
+        grid-template-columns: minmax(0, 1fr) minmax(140px, 180px) minmax(0, 1fr);
         gap: 0.6rem;
         align-items: center;
+        width: 100%;
       }
       .settings-grid {
         grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 220px);
@@ -139,6 +150,7 @@
         grid-template-columns: auto 1fr;
         gap: 0.6rem;
         align-items: center;
+        width: 100%;
       }
       .file-picker input[type="file"] {
         display: none;
@@ -155,7 +167,6 @@
         border: 1px solid #4c6898;
         padding: 0.6rem 0.8rem;
         font-size: 0.95rem;
-        box-sizing: border-box;
         max-width: 100%;
       }
       input,
@@ -244,6 +255,24 @@
       textarea {
         resize: vertical;
         min-height: 70px;
+        width: 100%;
+      }
+      .row > *,
+      form > *,
+      .custom-form > *,
+      .script-options-row > *,
+      .settings-grid > *,
+      .file-picker > * {
+        min-width: 0;
+        max-width: 100%;
+      }
+      input,
+      select,
+      textarea {
+        width: 100%;
+      }
+      button {
+        max-width: 100%;
       }
       #scriptCode {
         min-height: 160px;
@@ -278,6 +307,14 @@
         .script-options-row,
         .file-picker {
           grid-template-columns: 1fr;
+        }
+      }
+      @media (max-width: 980px) {
+        .settings-grid {
+          grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        }
+        .settings-grid .script-tip-block {
+          grid-column: 1 / -1;
         }
       }
     </style>
@@ -393,10 +430,10 @@ return { hits, samples: units };</textarea>
                 Sum Fields
                 <span class="tip-wrap">
                   <button class="tip-trigger" type="button" aria-label="What are sum fields?">?</button>
-                  <span class="tip-popup">Only for SUM reducer. Numeric fields to add from each shard result. For Pi use hits,samples.</span>
+                  <span class="tip-popup">Only for SUM reducer. Numeric fields to add from each shard result. For Pi use hits,samples. Use * to auto-sum all numeric top-level result fields.</span>
                 </span>
               </label>
-              <input id="shardSumFields" class="mono" value="hits,samples" placeholder="e.g. hits,samples" />
+              <input id="shardSumFields" class="mono" value="hits,samples" placeholder="e.g. hits,samples or *" />
             </div>
             <div class="setting-cell">
               <label class="setting-label" for="scriptArgs">

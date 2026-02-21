@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Cluster Worker</title>
     <style>
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
       :root {
         --bg: #102542;
         --card: #1f3b62;
@@ -25,6 +30,7 @@
         max-width: 760px;
         margin: 1.2rem auto;
         padding: 1rem;
+        width: 100%;
       }
       .card {
         background: color-mix(in srgb, var(--card) 85%, black);
@@ -32,6 +38,7 @@
         border-radius: 12px;
         padding: 1rem;
         margin-bottom: 1rem;
+        width: 100%;
       }
       h1 {
         margin: 0 0 0.4rem 0;
@@ -64,6 +71,7 @@
         display: grid;
         grid-template-columns: 1fr 1fr;
         gap: 0.45rem 0.9rem;
+        width: 100%;
       }
       .metric-label {
         color: var(--muted);
@@ -81,6 +89,7 @@
         grid-template-columns: minmax(130px, 190px) minmax(0, 1fr) auto;
         align-items: center;
         gap: 0.5rem;
+        width: 100%;
       }
       .graph-label {
         overflow: hidden;
@@ -123,7 +132,12 @@
         padding: 0.75rem;
         max-height: 280px;
         overflow-y: auto;
+        overflow-x: auto;
         color: var(--muted);
+      }
+      .metric-grid > *,
+      .graph-row > * {
+        min-width: 0;
       }
       @media (max-width: 640px) {
         .metric-grid {

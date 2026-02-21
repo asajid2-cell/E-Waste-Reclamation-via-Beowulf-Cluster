@@ -286,3 +286,44 @@ When `BASE_PATH` is set (for example `/cluster`), prefix all endpoints with it.
 - `POST /api/jobs/run-js` (token required)
 - `GET /api/jobs/:jobId` (token required)
 - `GET /api/workers` (token required)
+
+## 9. Benchmarking (Local vs Cluster)
+
+Use the benchmark suite to compare:
+
+- jobs/minute
+- units/second
+- cluster speedup vs local baseline
+
+Files:
+
+- `benchmarks/cluster_benchmark_suite.js` (single script used for both local and cluster)
+- `benchmarks/presets.json`
+- `scripts/benchmark-harness.js`
+
+Quick examples:
+
+```bash
+# Local baseline only
+node scripts/benchmark-harness.js --mode local --runs 1 --scale 1
+
+# Cluster only
+node scripts/benchmark-harness.js --mode cluster --runs 1 --scale 1 --host https://harmonizerlabs.cc --client-token "<token>"
+
+# Direct comparison in one run
+node scripts/benchmark-harness.js --mode both --runs 1 --scale 1 --host https://harmonizerlabs.cc --client-token "<token>"
+```
+
+Single one-shot benchmark (all tests in one submitted job):
+
+```bash
+node scripts/benchmark-harness.js --mode both --benchmarks suite --runs 1 --target-suite-seconds 60 --host https://harmonizerlabs.cc --client-token "<token>"
+```
+
+Longer stress run example:
+
+```bash
+node scripts/benchmark-harness.js --mode both --target-suite-seconds 150 --runs 1 --host https://harmonizerlabs.cc --client-token "<token>"
+```
+
+For detailed benchmark descriptions and reducer mapping, see `benchmarks/README.md`.
