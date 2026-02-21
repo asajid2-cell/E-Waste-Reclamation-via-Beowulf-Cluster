@@ -1031,7 +1031,7 @@ self.onmessage = async (event) => {
         if (!payload.task || payload.task.op !== "run_js" || typeof payload.task.code !== "string") {
           throw new Error("Signed task payload invalid.");
         }
-        if (!Number.isInteger(payload.task.timeoutMs) || payload.task.timeoutMs <= 0) {
+        if (!Number.isSafeInteger(payload.task.timeoutMs) || payload.task.timeoutMs < 0) {
           throw new Error("Signed task timeout invalid.");
         }
 
@@ -1040,21 +1040,27 @@ self.onmessage = async (event) => {
 
       function executeScript(code, args, timeoutMs, resultBudgetBytes) {
         return new Promise((resolve) => {
+          const MAX_TIMER_MS = 2147483647;
           const blob = new Blob([EXECUTOR_SOURCE], { type: "application/javascript" });
           const runnerUrl = URL.createObjectURL(blob);
           const runner = new Worker(runnerUrl);
+          const timeoutEnabled = Number.isInteger(timeoutMs) && timeoutMs > 0;
           let settled = false;
+          let timeout = null;
+          let timeoutDeadlineMs = null;
           const finish = (value) => {
             if (settled) {
               return;
             }
             settled = true;
-            clearTimeout(timeout);
+            if (timeout !== null) {
+              clearTimeout(timeout);
+            }
             runner.terminate();
             URL.revokeObjectURL(runnerUrl);
             resolve(value);
           };
-          const timeout = setTimeout(() => {
+          const onTimeout = () => {
             finish({
               ok: false,
               exitCode: 124,
@@ -1074,7 +1080,22 @@ self.onmessage = async (event) => {
               },
               notes: [],
             });
-          }, timeoutMs);
+          };
+          const scheduleLongTimeout = () => {
+            if (settled || timeoutDeadlineMs === null) {
+              return;
+            }
+            const remainingMs = timeoutDeadlineMs - Date.now();
+            if (remainingMs <= 0) {
+              onTimeout();
+              return;
+            }
+            timeout = setTimeout(scheduleLongTimeout, Math.min(remainingMs, MAX_TIMER_MS));
+          };
+          if (timeoutEnabled) {
+            timeoutDeadlineMs = Date.now() + timeoutMs;
+            scheduleLongTimeout();
+          }
 
           runner.addEventListener("message", (event) => {
             const message = event.data || {};
@@ -1154,7 +1175,7 @@ self.onmessage = async (event) => {
         appendLog(`verifying signed JS job ${jobId}`);
 
         const verifiedTask = await verifySignedTask(jobId, payload.signedTask);
-        appendLog(`running signed JS job ${jobId} timeout=${verifiedTask.timeoutMs}ms`);
+        appendLog(`running signed JS job ${jobId} timeout=${verifiedTask.timeoutMs > 0 ? `${verifiedTask.timeoutMs}ms` : "none"}`);
 
         const resultBudgetBytes = Math.max(4 * 1024, Math.floor(maxResultBytes * 0.9));
         const result = await executeScript(verifiedTask.code, verifiedTask.args, verifiedTask.timeoutMs, resultBudgetBytes);

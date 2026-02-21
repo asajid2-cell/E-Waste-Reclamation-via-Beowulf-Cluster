@@ -255,6 +255,11 @@ Custom job tuning:
 - `CUSTOM_JOB_MAX_TIMEOUT_MS`
 - `CUSTOM_JOB_DEFAULT_TIMEOUT_MS`
 
+Timeout behavior:
+
+- `timeoutMs=0` means no timeout.
+- Any non-negative safe integer timeout is accepted.
+
 Short invite tuning:
 
 - `SHORT_INVITE_CODE_LENGTH` (default `7`, min `4`, max `16`)

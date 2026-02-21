@@ -21,9 +21,9 @@ const MAX_SIGNED_JOB_TTL_SEC = 900;
 const DEFAULT_CUSTOM_JOB_MAX_CODE_BYTES = 32 * 1024;
 const DEFAULT_CUSTOM_JOB_MAX_ARGS_BYTES = 32 * 1024;
 const DEFAULT_CUSTOM_JOB_MAX_RESULT_BYTES = 64 * 1024;
-const DEFAULT_CUSTOM_JOB_TIMEOUT_MS = 5000;
-const MIN_CUSTOM_JOB_TIMEOUT_MS = 200;
-const MAX_CUSTOM_JOB_TIMEOUT_MS = 60_000;
+const DEFAULT_CUSTOM_JOB_TIMEOUT_MS = 0;
+const MIN_CUSTOM_JOB_TIMEOUT_MS = 0;
+const MAX_CUSTOM_JOB_TIMEOUT_MS = Number.MAX_SAFE_INTEGER;
 
 function toBase64Url(value) {
   return Buffer.from(value)
@@ -218,21 +218,19 @@ function resolveConfig() {
     1024 * 1024,
   );
 
-  const customJobMinTimeoutMs = clamp(
-    parsePositiveInt(process.env.CUSTOM_JOB_MIN_TIMEOUT_MS, MIN_CUSTOM_JOB_TIMEOUT_MS),
-    100,
-    MAX_CUSTOM_JOB_TIMEOUT_MS,
-  );
-  const customJobMaxTimeoutMs = clamp(
-    parsePositiveInt(process.env.CUSTOM_JOB_MAX_TIMEOUT_MS, MAX_CUSTOM_JOB_TIMEOUT_MS),
+  const customJobMinTimeoutMs = parseNonNegativeInt(process.env.CUSTOM_JOB_MIN_TIMEOUT_MS, MIN_CUSTOM_JOB_TIMEOUT_MS);
+  const customJobMaxTimeoutMs = Math.max(
     customJobMinTimeoutMs,
-    5 * 60_000,
+    parseNonNegativeInt(process.env.CUSTOM_JOB_MAX_TIMEOUT_MS, MAX_CUSTOM_JOB_TIMEOUT_MS),
   );
-  const customJobDefaultTimeoutMs = clamp(
-    parseNonNegativeInt(process.env.CUSTOM_JOB_DEFAULT_TIMEOUT_MS, DEFAULT_CUSTOM_JOB_TIMEOUT_MS),
-    customJobMinTimeoutMs,
-    customJobMaxTimeoutMs,
+  const customJobDefaultTimeoutMsRaw = parseNonNegativeInt(
+    process.env.CUSTOM_JOB_DEFAULT_TIMEOUT_MS,
+    DEFAULT_CUSTOM_JOB_TIMEOUT_MS,
   );
+  const customJobDefaultTimeoutMs =
+    customJobDefaultTimeoutMsRaw === 0
+      ? 0
+      : clamp(customJobDefaultTimeoutMsRaw, customJobMinTimeoutMs, customJobMaxTimeoutMs);
 
   const workerInviteRequireLatest = parseBoolean(process.env.WORKER_INVITE_REQUIRE_LATEST, true);
 

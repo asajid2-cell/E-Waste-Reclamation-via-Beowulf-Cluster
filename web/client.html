@@ -383,7 +383,7 @@ for (let i = 0; i < units; i += 1) {
 }
 return { hits, samples: units };</textarea>
           <div class="script-options-row">
-            <input id="scriptTimeoutMs" type="number" min="200" step="100" placeholder="run timeout ms (optional)" />
+            <input id="scriptTimeoutMs" type="number" min="0" step="1" placeholder="run timeout ms (optional, 0 = no timeout)" />
             <button id="submitScriptBtn" type="button">Run Script</button>
             <span id="autoModeHint" class="hint mono">Mode: auto single (default)</span>
           </div>
@@ -1018,8 +1018,8 @@ return hits;</pre>
 
         if (scriptTimeoutMsEl.value.trim()) {
           const timeoutMs = Number(scriptTimeoutMsEl.value);
-          if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-            errorEl.textContent = "Timeout must be a positive number.";
+          if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
+            errorEl.textContent = "Timeout must be a non-negative safe integer (0 = no timeout).";
             return;
           }
           body.timeoutMs = timeoutMs;

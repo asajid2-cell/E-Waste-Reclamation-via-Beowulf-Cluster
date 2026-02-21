@@ -54,14 +54,11 @@ function parseRunJsCreateBody(body, limits) {
   }
 
   const timeoutMs = body.timeoutMs === undefined ? limits.defaultTimeoutMs : Number(body.timeoutMs);
-  if (!Number.isInteger(timeoutMs)) {
-    return { ok: false, error: "timeoutMs must be an integer." };
+  if (!Number.isSafeInteger(timeoutMs)) {
+    return { ok: false, error: "timeoutMs must be a safe integer." };
   }
-  if (timeoutMs < limits.minTimeoutMs || timeoutMs > limits.maxTimeoutMs) {
-    return {
-      ok: false,
-      error: `timeoutMs must be in [${limits.minTimeoutMs}, ${limits.maxTimeoutMs}].`,
-    };
+  if (timeoutMs < 0) {
+    return { ok: false, error: "timeoutMs must be >= 0." };
   }
 
   const executionModelRaw = body.executionModel === undefined ? "single" : String(body.executionModel).trim().toLowerCase();
