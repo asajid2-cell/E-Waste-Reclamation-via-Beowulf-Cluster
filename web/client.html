@@ -637,6 +637,7 @@ return hits;</pre>
       let currentJobId = null;
       let pollTimer = null;
       let workersTimer = null;
+      let stopAllInFlight = false;
       let activeRaytraceSceneKey = null;
       let raytraceJobsByScene = (() => {
         try {
@@ -1271,7 +1272,9 @@ return {
         submitAddBtn.disabled = isBusy;
         submitScriptBtn.disabled = isBusy;
         startRaytraceBtnEl.disabled = isBusy;
-        stopAllJobsBtnEl.disabled = isBusy;
+        if (!stopAllInFlight) {
+          stopAllJobsBtnEl.disabled = false;
+        }
       }
 
       function detectExecutionModelFromInputs() {
@@ -1617,14 +1620,20 @@ return {
       });
 
       stopAllJobsBtnEl.addEventListener("click", async () => {
+        if (stopAllInFlight) {
+          return;
+        }
+        stopAllInFlight = true;
+        stopAllJobsBtnEl.disabled = true;
         try {
-          const stopped = await apiFetch(withBase("/api/jobs/stop-all"), {
-            method: "POST",
-          });
           if (pollTimer) {
             clearInterval(pollTimer);
             pollTimer = null;
           }
+          setStatus("stopping");
+          const stopped = await apiFetch(withBase("/api/jobs/stop-all"), {
+            method: "POST",
+          });
           currentJobId = null;
           activeRaytraceSceneKey = null;
           raytraceJobsByScene = {};
@@ -1637,6 +1646,9 @@ return {
           setBusy(false);
         } catch (err) {
           errorEl.textContent = err.message;
+        } finally {
+          stopAllInFlight = false;
+          stopAllJobsBtnEl.disabled = false;
         }
       });
 
