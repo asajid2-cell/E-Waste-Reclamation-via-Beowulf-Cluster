@@ -65,6 +65,73 @@
         grid-template-columns: 1fr 180px auto;
         gap: 0.6rem;
       }
+      .settings-grid {
+        grid-template-columns: 1fr 1fr 220px;
+      }
+      .setting-cell {
+        display: grid;
+        gap: 0.35rem;
+        align-items: start;
+      }
+      .setting-label {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        color: var(--muted);
+        font-size: 0.82rem;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+      }
+      .tip-wrap {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+      }
+      .tip-trigger {
+        width: 18px;
+        height: 18px;
+        border-radius: 999px;
+        border: 1px solid #6c8cbe;
+        padding: 0;
+        font-size: 0.75rem;
+        line-height: 1;
+        background: #16305a;
+        color: #cde7ff;
+        cursor: help;
+        font-weight: 700;
+      }
+      .tip-popup {
+        position: absolute;
+        left: 22px;
+        top: -6px;
+        width: 250px;
+        z-index: 20;
+        opacity: 0;
+        pointer-events: none;
+        transform: translateY(4px);
+        transition: opacity 120ms ease, transform 120ms ease;
+        background: #0b1933;
+        border: 1px solid #3f6293;
+        border-radius: 8px;
+        padding: 0.45rem 0.55rem;
+        color: #dce8fb;
+        font-size: 0.8rem;
+        line-height: 1.25;
+        text-transform: none;
+        letter-spacing: normal;
+        white-space: normal;
+      }
+      .tip-wrap:hover .tip-popup,
+      .tip-wrap:focus-within .tip-popup {
+        opacity: 1;
+        transform: translateY(0);
+      }
+      .script-tip-block {
+        display: grid;
+        gap: 0.25rem;
+        color: var(--muted);
+        font-size: 0.86rem;
+      }
       .file-picker {
         display: grid;
         grid-template-columns: auto 1fr;
@@ -274,20 +341,73 @@ return { samples, hits, pi };"
             <button id="submitScriptBtn" type="button">Run Script</button>
             <span id="autoModeHint" class="hint mono">Mode: auto single (default)</span>
           </div>
-          <div class="script-options-row">
-            <input id="shardTotalUnits" type="number" min="1" step="1" placeholder="total units (e.g. 100000000)" />
-            <input id="shardUnitsPerShard" type="number" min="1" step="1" placeholder="units per shard (e.g. 10000000)" />
-            <select id="shardReducer">
-              <option value="sum">Reducer: SUM</option>
-              <option value="collect">Reducer: COLLECT</option>
-              <option value="min">Reducer: MIN</option>
-              <option value="max">Reducer: MAX</option>
-            </select>
+          <div class="script-options-row settings-grid">
+            <div class="setting-cell">
+              <label class="setting-label" for="shardTotalUnits">
+                Total Units
+                <span class="tip-wrap">
+                  <button class="tip-trigger" type="button" aria-label="What is total units?">?</button>
+                  <span class="tip-popup">Total amount of work across the full cluster run. Pi example: total random samples to throw.</span>
+                </span>
+              </label>
+              <input id="shardTotalUnits" type="number" min="1" step="1" placeholder="e.g. 100000000" />
+            </div>
+            <div class="setting-cell">
+              <label class="setting-label" for="shardUnitsPerShard">
+                Units Per Shard
+                <span class="tip-wrap">
+                  <button class="tip-trigger" type="button" aria-label="What is units per shard?">?</button>
+                  <span class="tip-popup">Work size for each shard job. Lower = more shards and better load balancing; too low adds overhead.</span>
+                </span>
+              </label>
+              <input id="shardUnitsPerShard" type="number" min="1" step="1" placeholder="e.g. 10000000" />
+            </div>
+            <div class="setting-cell">
+              <label class="setting-label" for="shardReducer">
+                Reducer
+                <span class="tip-wrap">
+                  <button class="tip-trigger" type="button" aria-label="What is reducer?">?</button>
+                  <span class="tip-popup">How shard results are combined: SUM for counts/math, COLLECT for all outputs, MIN/MAX for optimization metrics.</span>
+                </span>
+              </label>
+              <select id="shardReducer">
+                <option value="sum">SUM (counts / totals)</option>
+                <option value="collect">COLLECT (all shard outputs)</option>
+                <option value="min">MIN (lowest value)</option>
+                <option value="max">MAX (highest value)</option>
+              </select>
+            </div>
+          </div>
+          <div class="script-options-row settings-grid">
+            <div class="setting-cell">
+              <label class="setting-label" for="shardSumFields">
+                Sum Fields
+                <span class="tip-wrap">
+                  <button class="tip-trigger" type="button" aria-label="What are sum fields?">?</button>
+                  <span class="tip-popup">Only for SUM reducer. Numeric fields to add from each shard result. For Pi use hits,samples.</span>
+                </span>
+              </label>
+              <input id="shardSumFields" class="mono" placeholder="e.g. hits,samples" />
+            </div>
+            <div class="setting-cell">
+              <label class="setting-label" for="scriptArgs">
+                Args JSON
+                <span class="tip-wrap">
+                  <button class="tip-trigger" type="button" aria-label="What are args JSON?">?</button>
+                  <span class="tip-popup">Optional parameters passed to script as args. Example: {\"seed\":123,\"samples\":1000000}</span>
+                </span>
+              </label>
+              <input id="scriptArgs" class="mono" placeholder='optional, e.g. {"samples":10000000}' />
+            </div>
+            <div class="script-tip-block">
+              <span>Auto mode: both shard fields empty = single; both filled = sharded.</span>
+              <span>Recommended start: make 2-4 shards per active worker.</span>
+            </div>
           </div>
           <div class="script-options-row">
-            <input id="shardSumFields" class="mono" placeholder="sum fields (comma-separated), e.g. hits,samples" />
-            <input id="scriptArgs" class="mono" placeholder='args JSON (optional), e.g. {"samples":10000000}' />
-            <div class="script-inline-note">For <span class="mono">&nbsp;sum&nbsp;</span> reducer, default fields are <span class="mono">&nbsp;hits,samples</span>.</div>
+            <div class="script-inline-note">For Pi: <span class="mono">&nbsp;total=100000000, shard=10000000, reducer=sum, fields=hits,samples</span>.</div>
+            <div></div>
+            <div></div>
           </div>
           <div class="guide-link-row">
             <button id="toggleParallelGuideBtn" class="secondary" type="button">Show Parallel Guide</button>
@@ -526,26 +646,45 @@ return hits;</pre>
         return "invalid";
       }
 
+      function refreshReducerUi() {
+        if (shardReducerEl.disabled) {
+          shardSumFieldsEl.disabled = true;
+          shardSumFieldsEl.placeholder = "sum fields disabled in single mode";
+          return;
+        }
+        const isSum = shardReducerEl.value === "sum";
+        shardSumFieldsEl.disabled = !isSum;
+        if (isSum) {
+          shardSumFieldsEl.placeholder = "e.g. hits,samples";
+        } else if (shardReducerEl.value === "collect") {
+          shardSumFieldsEl.placeholder = "not used for COLLECT";
+        } else if (shardReducerEl.value === "min") {
+          shardSumFieldsEl.placeholder = "not used for MIN (server uses field 'value')";
+        } else {
+          shardSumFieldsEl.placeholder = "not used for MAX (server uses field 'value')";
+        }
+      }
+
       function refreshAutoModeUi() {
         const model = detectExecutionModelFromInputs();
         if (model === "single") {
           autoModeHintEl.textContent = "Mode: auto single (default)";
           autoModeHintEl.className = "hint mono";
           shardReducerEl.disabled = true;
-          shardSumFieldsEl.disabled = true;
+          refreshReducerUi();
           return;
         }
         if (model === "sharded") {
-          autoModeHintEl.textContent = "Mode: auto sharded";
+          autoModeHintEl.textContent = "Mode: auto sharded (cluster fan-out enabled)";
           autoModeHintEl.className = "hint mono ok";
           shardReducerEl.disabled = false;
-          shardSumFieldsEl.disabled = false;
+          refreshReducerUi();
           return;
         }
         autoModeHintEl.textContent = "Mode: invalid shard setup (set both shard fields or clear both)";
         autoModeHintEl.className = "hint mono warn-text";
         shardReducerEl.disabled = false;
-        shardSumFieldsEl.disabled = false;
+        refreshReducerUi();
       }
 
       function clearInviteQr() {
@@ -718,6 +857,12 @@ return hits;</pre>
           errorEl.textContent = "Set both shard fields for sharded mode, or leave both empty for single mode.";
           return;
         }
+        const referencesBrain = /\b__BRAIN__\b/.test(code);
+        if (executionModel === "single" && referencesBrain) {
+          errorEl.textContent =
+            "This script references __BRAIN__. Fill both shard fields to run in sharded mode, or remove __BRAIN__ usage.";
+          return;
+        }
         const body = { code, executionModel };
         const rawArgs = scriptArgsEl.value.trim();
         if (rawArgs) {
@@ -773,6 +918,7 @@ return hits;</pre>
 
       shardTotalUnitsEl.addEventListener("input", refreshAutoModeUi);
       shardUnitsPerShardEl.addEventListener("input", refreshAutoModeUi);
+      shardReducerEl.addEventListener("change", refreshReducerUi);
       toggleParallelGuideBtnEl.addEventListener("click", () => {
         const isNowHidden = parallelGuidePanelEl.classList.toggle("hidden");
         toggleParallelGuideBtnEl.textContent = isNowHidden ? "Show Parallel Guide" : "Hide Parallel Guide";
@@ -808,6 +954,7 @@ return hits;</pre>
       }
       openGuidePageLinkEl.href = withBase("/parallel-guide.html");
       refreshAutoModeUi();
+      refreshReducerUi();
     </script>
   </body>
 </html>

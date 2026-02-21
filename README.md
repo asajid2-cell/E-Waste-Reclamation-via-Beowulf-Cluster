@@ -100,6 +100,26 @@ Inline code is also supported:
 node cli/cluster-cli.js run-js --code "return (args.a||0)+(args.b||0)" --args-json '{"a":2,"b":2}'
 ```
 
+### Pi examples: single vs sharded
+
+Files:
+
+- `examples/pi-single.js` (single worker)
+- `examples/pi-sharded.js` (cluster sharded, uses `globalThis.__BRAIN__?.units`)
+
+Use `pi-single.js` when you want one worker to do all work.
+
+Use `pi-sharded.js` when you want cluster fan-out:
+
+- in web UI, set `total units` and `units per shard`
+- reducer `sum`
+- sum fields `hits,samples`
+
+If shard fields are left empty, run mode auto-resolves to `single`.
+For `run_js`, reducers read numeric fields from top-level result or `returnValue`.
+
+Then compute `pi ~= 4 * (aggregate.hits / aggregate.samples)`.
+
 ### Generate worker invite
 
 ```bash

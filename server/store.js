@@ -48,8 +48,20 @@ function applyReducerResult(reducer, aggregate, shardResult) {
     if (!shardResult || typeof shardResult !== "object" || Array.isArray(shardResult)) {
       throw new Error("sum reducer expects shard result object.");
     }
+    const envelopeReturn =
+      shardResult &&
+      typeof shardResult === "object" &&
+      shardResult.returnValue &&
+      typeof shardResult.returnValue === "object" &&
+      !Array.isArray(shardResult.returnValue)
+        ? shardResult.returnValue
+        : null;
     for (const field of reducer.fields || []) {
-      const value = Number(shardResult[field]);
+      let rawValue = shardResult[field];
+      if (!Number.isFinite(Number(rawValue)) && envelopeReturn) {
+        rawValue = envelopeReturn[field];
+      }
+      const value = Number(rawValue);
       if (!Number.isFinite(value)) {
         throw new Error(`sum reducer field '${field}' must be numeric.`);
       }
@@ -60,7 +72,18 @@ function applyReducerResult(reducer, aggregate, shardResult) {
 
   if (reducer.type === "min" || reducer.type === "max") {
     const field = reducer.field;
-    const numeric = Number(shardResult && typeof shardResult === "object" ? shardResult[field] : NaN);
+    let rawValue = shardResult && typeof shardResult === "object" ? shardResult[field] : NaN;
+    if (
+      !Number.isFinite(Number(rawValue)) &&
+      shardResult &&
+      typeof shardResult === "object" &&
+      shardResult.returnValue &&
+      typeof shardResult.returnValue === "object" &&
+      !Array.isArray(shardResult.returnValue)
+    ) {
+      rawValue = shardResult.returnValue[field];
+    }
+    const numeric = Number(rawValue);
     if (!Number.isFinite(numeric)) {
       throw new Error(`${reducer.type} reducer field '${field}' must be numeric.`);
     }
