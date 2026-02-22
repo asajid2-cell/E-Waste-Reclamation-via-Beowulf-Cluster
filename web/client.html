@@ -375,6 +375,8 @@
         </div>
       </div>
 
+      <!--
+      Legacy demo path disabled: Submit Job (a + b)
       <div class="card stack">
         <strong>Submit Job (a + b)</strong>
         <form id="addJobForm">
@@ -383,6 +385,7 @@
           <button id="submitAddBtn" type="submit">Submit</button>
         </form>
       </div>
+      -->
 
       <div class="card stack">
         <strong>Run Your Own JS (Signed)</strong>
@@ -1365,7 +1368,9 @@ return {
       }
 
       function setBusy(isBusy) {
-        submitAddBtn.disabled = isBusy;
+        if (submitAddBtn) {
+          submitAddBtn.disabled = isBusy;
+        }
         submitScriptBtn.disabled = isBusy;
         startRaytraceBtnEl.disabled = isBusy;
         if (!stopAllInFlight) {
@@ -1670,12 +1675,15 @@ return {
         }
       });
 
-      addJobForm.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        const a = Number(inputA.value);
-        const b = Number(inputB.value);
-        await submitAndPoll("/api/jobs", { a, b });
-      });
+      // Legacy add demo disabled.
+      // if (addJobForm) {
+      //   addJobForm.addEventListener("submit", async (event) => {
+      //     event.preventDefault();
+      //     const a = Number(inputA.value);
+      //     const b = Number(inputB.value);
+      //     await submitAndPoll("/api/jobs", { a, b });
+      //   });
+      // }
 
       startRaytraceBtnEl.addEventListener("click", async () => {
         const workerCount = getConnectedWorkerCount();

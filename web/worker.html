@@ -1342,18 +1342,19 @@ self.onmessage = async (event) => {
         });
       }
 
-      async function handleAddAssignment(jobId, payload) {
-        if (!payload || payload.op !== "add" || !Number.isInteger(payload.a) || !Number.isInteger(payload.b)) {
-          send({ type: "error", workerId, jobId: jobId || "unknown", error: "Malformed add payload" });
-          return;
-        }
-
-        currentJobEl.textContent = jobId;
-        appendLog(`processing add job ${jobId}: ${payload.a} + ${payload.b}`);
-        const result = payload.a + payload.b;
-        send({ type: "result", workerId, jobId, result });
-        appendLog(`sent add result for ${jobId}`);
-      }
+      // Legacy add demo disabled. Keeping implementation commented for reference.
+      // async function handleAddAssignment(jobId, payload) {
+      //   if (!payload || payload.op !== "add" || !Number.isInteger(payload.a) || !Number.isInteger(payload.b)) {
+      //     send({ type: "error", workerId, jobId: jobId || "unknown", error: "Malformed add payload" });
+      //     return;
+      //   }
+      //
+      //   currentJobEl.textContent = jobId;
+      //   appendLog(`processing add job ${jobId}: ${payload.a} + ${payload.b}`);
+      //   const result = payload.a + payload.b;
+      //   send({ type: "result", workerId, jobId, result });
+      //   appendLog(`sent add result for ${jobId}`);
+      // }
 
       async function handleRunJsAssignment(jobId, payload) {
         currentJobEl.textContent = jobId;
@@ -1379,7 +1380,7 @@ self.onmessage = async (event) => {
 
         try {
           if (payload.op === "add") {
-            await handleAddAssignment(jobId, payload);
+            throw new Error("Legacy add task is disabled.");
           } else if (payload.op === "run_js") {
             await handleRunJsAssignment(jobId, payload);
           } else {

@@ -10,10 +10,10 @@ const QRCode = require("qrcode");
 const { wordlists } = require("bip39");
 const { WebSocketServer } = require("ws");
 
-const { createStore, isValidInputNumber, MIN_VALUE, MAX_VALUE } = require("./store");
+const { createStore } = require("./store");
 const { createDispatcher } = require("./dispatcher");
 const { createAuth, resolveConfig } = require("./auth");
-const { parseInviteRequestBody, parseJobCreateBody, parseRunJsCreateBody, parseWorkerMessage } = require("./validation");
+const { parseInviteRequestBody, parseRunJsCreateBody, parseWorkerMessage } = require("./validation");
 
 const PORT = parsePositiveInt(process.env.PORT, 8080);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -455,17 +455,21 @@ app.post(withBasePath("/api/invites/worker"), auth.requireClientAuth, async (req
   });
 });
 
-app.post(withBasePath("/api/jobs"), auth.requireClientAuth, (req, res) => {
-  const parsed = parseJobCreateBody(req.body, isValidInputNumber);
-  if (!parsed.ok) {
-    return res.status(400).json({
-      error: `${parsed.error} Fields 'a' and 'b' must be integers in [${MIN_VALUE}, ${MAX_VALUE}].`,
-    });
-  }
-
-  const job = store.createJob(parsed.value);
-  dispatcher.dispatch();
-  return res.status(201).json({ jobId: job.jobId, status: job.status });
+// Legacy demo route disabled (a + b example).
+// app.post(withBasePath("/api/jobs"), auth.requireClientAuth, (req, res) => {
+//   const parsed = parseJobCreateBody(req.body, isValidInputNumber);
+//   if (!parsed.ok) {
+//     return res.status(400).json({
+//       error: `${parsed.error} Fields 'a' and 'b' must be integers in [${MIN_VALUE}, ${MAX_VALUE}].`,
+//     });
+//   }
+//
+//   const job = store.createJob(parsed.value);
+//   dispatcher.dispatch();
+//   return res.status(201).json({ jobId: job.jobId, status: job.status });
+// });
+app.post(withBasePath("/api/jobs"), auth.requireClientAuth, (_req, res) => {
+  return res.status(410).json({ error: "Legacy add demo endpoint is disabled. Use /api/jobs/run-js." });
 });
 
 app.post(withBasePath("/api/jobs/run-js"), auth.requireClientAuth, (req, res) => {
