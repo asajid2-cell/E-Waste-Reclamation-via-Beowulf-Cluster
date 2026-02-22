@@ -10,3 +10,6 @@ Many people have created Beowulf clusters before, however almost all of them req
 The architecture consists of a central server that receives tasks from the client and distributes them to light edge nodes. The whole system can run over the internet or on a local network if security is needed.
 
 All tasks are written in javascript and can therefore be executed on any devices with a javascript enabled web browser.
+
+## Example Video
+[![Example Video](https://img.youtube.com/vi/EMVNUKEHENw/0.jpg)](https://youtube.com/shorts/EMVNUKEHENw?feature=share)
