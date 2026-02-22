@@ -4,7 +4,7 @@ const MIN_VALUE = -1_000_000_000;
 const MAX_VALUE = 1_000_000_000;
 const DEFAULT_MAX_CUSTOM_RESULT_BYTES = 64 * 1024;
 const DEFAULT_MAX_SHARD_ATTEMPTS = 3;
-const DEFAULT_MAX_WORKER_SLOTS = 8;
+const DEFAULT_MAX_WORKER_SLOTS = 64;
 const DEFAULT_JOB_EVENT_BUFFER_SIZE = 4000;
 const DEFAULT_JOB_EVENT_BUFFER_MAX_BYTES = 32 * 1024 * 1024;
 const DEFAULT_JOB_EVENT_MAX_BYTES = 2 * 1024 * 1024;
@@ -219,8 +219,19 @@ function createStore(options = {}) {
     const hc = Math.trunc(clampNumber(capabilities.hardwareConcurrency, 1, 128, 1));
     const memoryGb = clampNumber(capabilities.deviceMemoryGB, 0.25, 256, 1);
     const cpuBound = Math.max(1, hc > 2 ? hc - 1 : 1);
-    const memBound = Math.max(1, Math.floor(memoryGb));
-    let slots = Math.max(1, Math.min(cpuBound, memBound, maxWorkerSlots));
+    let memoryCap = maxWorkerSlots;
+    if (memoryGb < 2) {
+      memoryCap = Math.min(memoryCap, 2);
+    } else if (memoryGb < 4) {
+      memoryCap = Math.min(memoryCap, 4);
+    } else if (memoryGb < 8) {
+      memoryCap = Math.min(memoryCap, 8);
+    } else if (memoryGb < 16) {
+      memoryCap = Math.min(memoryCap, 16);
+    } else if (memoryGb < 32) {
+      memoryCap = Math.min(memoryCap, 32);
+    }
+    let slots = Math.max(1, Math.min(cpuBound, memoryCap, maxWorkerSlots));
     if (capabilities.charging === false && capabilities.batteryLevel < 0.15) {
       slots = 1;
     }

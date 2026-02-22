@@ -195,7 +195,7 @@
       const HEARTBEAT_INTERVAL_MS = 20_000;
       const MAX_CLOCK_SKEW_MS = 30_000;
       const DEFAULT_MAX_RESULT_BYTES = 64 * 1024;
-      const EXECUTOR_POOL_HARD_MAX = 8;
+      const EXECUTOR_POOL_HARD_MAX = 64;
       const EXECUTOR_POOL_MIN = 1;
       const BASE_PATH = (() => {
         const path = window.location.pathname.replace(/\/+$/, "");
@@ -765,8 +765,19 @@ self.onmessage = async (event) => {
         const memGb = Number.isFinite(rawMem) && rawMem > 0 ? rawMem : 2;
 
         const cpuBound = Math.max(1, cpuCount > 2 ? cpuCount - 1 : 1);
-        const memBound = Math.max(1, Math.floor(memGb));
-        let slots = Math.max(EXECUTOR_POOL_MIN, Math.min(cpuBound, memBound, EXECUTOR_POOL_HARD_MAX));
+        let memoryCap = EXECUTOR_POOL_HARD_MAX;
+        if (memGb < 2) {
+          memoryCap = 2;
+        } else if (memGb < 4) {
+          memoryCap = 4;
+        } else if (memGb < 8) {
+          memoryCap = 8;
+        } else if (memGb < 16) {
+          memoryCap = 16;
+        } else if (memGb < 32) {
+          memoryCap = 32;
+        }
+        let slots = Math.max(EXECUTOR_POOL_MIN, Math.min(cpuBound, memoryCap, EXECUTOR_POOL_HARD_MAX));
 
         const effectiveType = String(connection.effectiveType || "").toLowerCase();
         if (effectiveType === "slow-2g" || effectiveType === "2g") {
@@ -1004,7 +1015,13 @@ self.onmessage = async (event) => {
           destroyExecutorHandle(removed);
         }
         if (previousTarget !== executorTargetSize) {
-          appendLog(`executor pool size set to ${executorTargetSize}`);
+          const caps = capabilitySnapshot || {};
+          const conn = caps.connection && typeof caps.connection === "object" ? caps.connection : {};
+          appendLog(
+            `executor pool size set to ${executorTargetSize} ` +
+              `(cpu=${caps.hardwareConcurrency || "?"}, mem=${caps.deviceMemoryGB || "?"}GB, ` +
+              `net=${conn.effectiveType || "?"}, saveData=${conn.saveData === true ? "on" : "off"})`,
+          );
         }
       }
 

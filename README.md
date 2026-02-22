@@ -274,7 +274,7 @@ Rate/shard safety tuning:
 - `SHARD_MIN_UNITS` (default `1`)
 - `SHARD_MAX_PER_WORKER` (default `200`)
 - `SHARD_ABSOLUTE_MAX` (default `9007199254740991`)
-- `WORKER_MAX_CONCURRENT_JOBS` (default `8`)
+- `WORKER_MAX_CONCURRENT_JOBS` (default `64`)
 
 ## 8. Key Endpoints
 
