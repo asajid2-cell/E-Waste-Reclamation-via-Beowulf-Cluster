@@ -159,6 +159,13 @@ function createStore(options = {}) {
     if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
       return null;
     }
+    const hardwareConcurrency = Math.trunc(clampNumber(capabilities.hardwareConcurrency, 1, 128, 1));
+    const reportedMemory = Number(capabilities.deviceMemoryGB);
+    const estimatedMemory = Math.max(1, Math.min(32, Math.ceil(hardwareConcurrency / 2)));
+    const deviceMemoryGB =
+      Number.isFinite(reportedMemory) && reportedMemory > 0
+        ? clampNumber(reportedMemory, 0.25, 256, estimatedMemory)
+        : estimatedMemory;
     const connection =
       capabilities.connection && typeof capabilities.connection === "object" && !Array.isArray(capabilities.connection)
         ? capabilities.connection
@@ -168,8 +175,8 @@ function createStore(options = {}) {
         ? capabilities.battery
         : {};
     const normalized = {
-      hardwareConcurrency: Math.trunc(clampNumber(capabilities.hardwareConcurrency, 1, 128, 1)),
-      deviceMemoryGB: clampNumber(capabilities.deviceMemoryGB, 0.25, 256, 1),
+      hardwareConcurrency,
+      deviceMemoryGB,
       effectiveType:
         typeof connection.effectiveType === "string" && connection.effectiveType.length <= 16
           ? connection.effectiveType
@@ -218,7 +225,11 @@ function createStore(options = {}) {
     }
     const hc = Math.trunc(clampNumber(capabilities.hardwareConcurrency, 1, 128, 1));
     const memoryGb = clampNumber(capabilities.deviceMemoryGB, 0.25, 256, 1);
-    const cpuBound = Math.max(1, hc > 2 ? hc - 1 : 1);
+    const platform = String(capabilities.platform || "").toLowerCase();
+    const effectiveType = String(capabilities.effectiveType || "").toLowerCase();
+    const isMobileLike = /android|iphone|ipad|ipod|mobile/.test(platform);
+    const cpuReserve = isMobileLike ? 1 : 0;
+    const cpuBound = Math.max(1, hc - cpuReserve);
     let memoryCap = maxWorkerSlots;
     if (memoryGb < 2) {
       memoryCap = Math.min(memoryCap, 2);
@@ -231,12 +242,22 @@ function createStore(options = {}) {
     } else if (memoryGb < 32) {
       memoryCap = Math.min(memoryCap, 32);
     }
-    let slots = Math.max(1, Math.min(cpuBound, memoryCap, maxWorkerSlots));
-    if (capabilities.charging === false && capabilities.batteryLevel < 0.15) {
+    const lowBattery = capabilities.charging === false && capabilities.batteryLevel < 0.15;
+    const severeNetwork = effectiveType === "slow-2g" || effectiveType === "2g";
+    const preferredMobileMin = isMobileLike && hc >= 4 && !lowBattery && !severeNetwork ? 2 : 1;
+    let slots = Math.max(preferredMobileMin, Math.min(cpuBound, memoryCap, maxWorkerSlots));
+    if (severeNetwork) {
       slots = 1;
+    } else if (effectiveType === "3g") {
+      slots = Math.min(slots, Math.max(preferredMobileMin, 2));
     }
     if (capabilities.saveData) {
-      slots = Math.max(1, Math.min(slots, 2));
+      slots = Math.max(preferredMobileMin, Math.min(slots, 2));
+    }
+    if (lowBattery) {
+      slots = 1;
+    } else if (capabilities.charging === false && capabilities.batteryLevel < 0.25) {
+      slots = Math.max(preferredMobileMin, Math.min(slots, 2));
     }
     return slots;
   }

@@ -685,6 +685,7 @@ return hits;</pre>
       let pollTimer = null;
       let workersTimer = null;
       let stopAllInFlight = false;
+      let lastWorkersSnapshot = null;
       let activeRaytraceSceneKey = null;
       let publicMaxResultBytes = DEFAULT_RAYTRACE_RESULT_LIMIT_BYTES;
       let raytraceJobsByScene = (() => {
@@ -1392,9 +1393,26 @@ return {
         return workerCount;
       }
 
-      function computeShardSafety(totalUnits, workerCount) {
-        const effectiveWorkers = Math.max(workerCount || 2, 2);
-        const maxShardsAllowed = Math.max(1, Math.min(SHARD_ABSOLUTE_MAX, effectiveWorkers * SHARD_MAX_PER_WORKER));
+      function getEffectiveParallelSlots() {
+        if (!lastWorkersSnapshot || !Array.isArray(lastWorkersSnapshot.workers)) {
+          return null;
+        }
+        const totalSlots = Number(lastWorkersSnapshot.totalSlots);
+        if (Number.isFinite(totalSlots) && totalSlots >= 0) {
+          return Math.trunc(totalSlots);
+        }
+        return lastWorkersSnapshot.workers.reduce((sum, worker) => {
+          const slots = Number(worker && worker.maxSlots);
+          return sum + (Number.isFinite(slots) && slots > 0 ? Math.trunc(slots) : 1);
+        }, 0);
+      }
+
+      function computeShardSafety(totalUnits, parallelismHint) {
+        const effectiveParallelism = Math.max(parallelismHint || 2, 2);
+        const maxShardsAllowed = Math.max(
+          1,
+          Math.min(SHARD_ABSOLUTE_MAX, effectiveParallelism * SHARD_MAX_PER_WORKER),
+        );
         const recommendedUnits = Math.max(SHARD_MIN_UNITS, Math.ceil(totalUnits / maxShardsAllowed));
         return { maxShardsAllowed, recommendedUnits };
       }
@@ -1408,14 +1426,16 @@ return {
           return null;
         }
         const workerCount = getConnectedWorkerCount();
-        if (workerCount !== null && workerCount < 2) {
+        const effectiveSlots = getEffectiveParallelSlots();
+        if (effectiveSlots !== null && effectiveSlots < 2) {
           return {
             changed: false,
             workerCount,
+            effectiveSlots,
             skippedForSingleFallback: true,
           };
         }
-        const safety = computeShardSafety(totalUnits, workerCount);
+        const safety = computeShardSafety(totalUnits, effectiveSlots || workerCount);
         const currentUnits = Number(shardUnitsPerShardEl.value);
         if (!Number.isInteger(currentUnits) || currentUnits <= 0) {
           return null;
@@ -1425,6 +1445,7 @@ return {
         return {
           changed: false,
           workerCount,
+          effectiveSlots,
           totalUnits,
           unitsPerShard: finalUnitsPerShard,
           resultingShards,
@@ -1454,6 +1475,7 @@ return {
       function refreshAutoModeUi() {
         const model = detectExecutionModelFromInputs();
         const workerCount = getConnectedWorkerCount();
+        const effectiveSlots = getEffectiveParallelSlots();
         if (model === "single") {
           autoModeHintEl.textContent = "Mode: auto single (default)";
           autoModeHintEl.className = "hint mono";
@@ -1462,15 +1484,17 @@ return {
           return;
         }
         if (model === "sharded") {
-          if (workerCount !== null && workerCount < 2) {
+          if (effectiveSlots !== null && effectiveSlots < 2) {
             autoModeHintEl.textContent =
-              "Mode: auto sharded requested, but server will run single until at least 2 workers are connected";
+              "Mode: auto sharded requested, but server will run single until at least 2 effective worker slots are available";
             autoModeHintEl.className = "hint mono warn-text";
           } else {
             const tuneInfo = autoTuneShardInputs();
+            const slotSummary =
+              effectiveSlots !== null ? `, ${effectiveSlots} slot(s)` : workerCount !== null ? `, ${workerCount} worker(s)` : "";
             const tunedMessage =
               tuneInfo && Number.isInteger(tuneInfo.resultingShards)
-                ? `Mode: auto sharded (cluster fan-out enabled, ${tuneInfo.resultingShards} shard(s))`
+                ? `Mode: auto sharded (cluster fan-out enabled, ${tuneInfo.resultingShards} shard(s)${slotSummary})`
                 : "Mode: auto sharded (cluster fan-out enabled)";
             autoModeHintEl.textContent = tunedMessage;
             autoModeHintEl.className = "hint mono ok";
@@ -1534,8 +1558,10 @@ return {
       async function fetchWorkerCount() {
         try {
           const data = await apiFetch(withBase("/api/workers"));
+          lastWorkersSnapshot = data && typeof data === "object" ? data : null;
           workerCountEl.textContent = String(data.count);
         } catch (_err) {
+          lastWorkersSnapshot = null;
           workerCountEl.textContent = "-";
         }
         refreshAutoModeUi();
@@ -1653,8 +1679,9 @@ return {
 
       startRaytraceBtnEl.addEventListener("click", async () => {
         const workerCount = getConnectedWorkerCount();
-        if (workerCount !== null && workerCount < 2) {
-          errorEl.textContent = "Live raytrace needs at least 2 connected workers.";
+        const effectiveSlots = getEffectiveParallelSlots();
+        if (effectiveSlots !== null && effectiveSlots < 2) {
+          errorEl.textContent = "Live raytrace needs at least 2 effective worker slots.";
           return;
         }
 
@@ -1700,7 +1727,7 @@ return {
         const tilesX = Math.ceil(settings.width / settings.tileSize);
         const tilesY = Math.ceil(settings.height / settings.tileSize);
         const totalShards = Math.max(1, tilesX * tilesY * settings.passes);
-        const effectiveWorkers = Math.max(2, workerCount || 0);
+        const effectiveWorkers = Math.max(2, effectiveSlots || workerCount || 0);
         const unitsPerShard = 1;
         const plannedShardCount = Math.ceil(totalShards / unitsPerShard);
         const payload = {
@@ -1722,7 +1749,7 @@ return {
         if (!created || !created.jobId) {
           return;
         }
-        raytraceHintEl.textContent = `Raytrace planned with ${plannedShardCount} shard job(s) across ${effectiveWorkers} worker(s).`;
+        raytraceHintEl.textContent = `Raytrace planned with ${plannedShardCount} shard job(s) across ${effectiveWorkers} slot(s).`;
         raytraceHintEl.className = "hint mono ok";
         activeRaytraceSceneKey = sceneKey;
         rememberSceneJob(sceneKey, created.jobId);

@@ -58,14 +58,29 @@ function parsePositiveInt(value, fallback) {
   return n;
 }
 
-function computeShardSafety(totalUnits, connectedWorkers) {
-  const effectiveWorkers = Math.max(Number(connectedWorkers) || 0, 2);
-  const maxShardsAllowed = Math.max(1, Math.min(SHARD_ABSOLUTE_MAX, effectiveWorkers * SHARD_MAX_PER_WORKER));
+function computeShardSafety(totalUnits, parallelismHint) {
+  const effectiveParallelism = Math.max(Number(parallelismHint) || 0, 2);
+  const maxShardsAllowed = Math.max(1, Math.min(SHARD_ABSOLUTE_MAX, effectiveParallelism * SHARD_MAX_PER_WORKER));
   const tunedUnitsPerShard = Math.max(SHARD_MIN_UNITS, Math.ceil(totalUnits / maxShardsAllowed));
   return {
     maxShardsAllowed,
     tunedUnitsPerShard,
     tunedTotalShards: Math.ceil(totalUnits / tunedUnitsPerShard),
+  };
+}
+
+function summarizeWorkerCapacity(workers) {
+  if (!Array.isArray(workers) || workers.length === 0) {
+    return { connectedWorkers: 0, totalSlots: 0 };
+  }
+  let totalSlots = 0;
+  for (const worker of workers) {
+    const slots = Number(worker && worker.maxSlots);
+    totalSlots += Number.isFinite(slots) && slots > 0 ? Math.trunc(slots) : 1;
+  }
+  return {
+    connectedWorkers: workers.length,
+    totalSlots,
   };
 }
 
@@ -465,10 +480,11 @@ app.post(withBasePath("/api/jobs/run-js"), auth.requireClientAuth, (req, res) =>
     return res.status(400).json({ error: parsed.error });
   }
 
-  const connectedWorkers = store.listWorkers().length;
+  const workerSnapshot = store.listWorkers();
+  const { connectedWorkers, totalSlots } = summarizeWorkerCapacity(workerSnapshot);
   let createValue = parsed.value;
   const executionNotes = [];
-  if (parsed.value.executionModel === "sharded" && connectedWorkers < 2) {
+  if (parsed.value.executionModel === "sharded" && totalSlots < 2) {
     const fallbackArgs = {
       ...(parsed.value.args && typeof parsed.value.args === "object" && !Array.isArray(parsed.value.args)
         ? parsed.value.args
@@ -484,14 +500,14 @@ app.post(withBasePath("/api/jobs/run-js"), auth.requireClientAuth, (req, res) =>
       shardConfig: null,
       reducer: null,
     };
-    executionNotes.push("Sharded execution auto-downgraded to single because fewer than 2 workers are connected.");
+    executionNotes.push("Sharded execution auto-downgraded to single because effective parallel slots are below 2.");
   } else if (parsed.value.executionModel === "sharded" && parsed.value.shardConfig) {
     const requestedUnitsPerShard = parsed.value.shardConfig.unitsPerShard;
-    const safety = computeShardSafety(parsed.value.shardConfig.totalUnits, connectedWorkers);
+    const safety = computeShardSafety(parsed.value.shardConfig.totalUnits, Math.max(connectedWorkers, totalSlots));
     const requestedTotalShards = Math.ceil(parsed.value.shardConfig.totalUnits / requestedUnitsPerShard);
     if (requestedTotalShards > safety.maxShardsAllowed) {
       executionNotes.push(
-        `High shard fan-out requested (${requestedTotalShards} shards); recommended soft cap is ${safety.maxShardsAllowed} for current worker count (${connectedWorkers}).`,
+        `High shard fan-out requested (${requestedTotalShards} shards); recommended soft cap is ${safety.maxShardsAllowed} for current capacity (${connectedWorkers} worker(s), ${totalSlots} slot(s)).`,
       );
     }
     createValue = {
@@ -586,7 +602,8 @@ app.get(withBasePath("/api/jobs/:jobId/events"), auth.requireClientAuth, (req, r
 
 app.get(withBasePath("/api/workers"), auth.requireClientAuth, (_req, res) => {
   const workers = store.listWorkers();
-  return res.json({ count: workers.length, workers });
+  const { totalSlots } = summarizeWorkerCapacity(workers);
+  return res.json({ count: workers.length, totalSlots, workers });
 });
 
 app.get(withBasePath("/api/metrics/cluster"), auth.requireClientAuth, (_req, res) => {

@@ -758,13 +758,17 @@ self.onmessage = async (event) => {
         const caps = capabilitySnapshot || {};
         const connection = caps.connection && typeof caps.connection === "object" ? caps.connection : {};
         const battery = caps.battery && typeof caps.battery === "object" ? caps.battery : {};
+        const platform = String(caps.platform || navigator.platform || "").toLowerCase();
+        const ua = String(navigator.userAgent || "").toLowerCase();
+        const isMobileLike = /android|iphone|ipad|ipod|mobile/.test(platform) || /android|iphone|ipad|ipod|mobile/.test(ua);
 
         const rawCpu = Number(caps.hardwareConcurrency);
         const cpuCount = Number.isFinite(rawCpu) && rawCpu > 0 ? Math.round(rawCpu) : 2;
         const rawMem = Number(caps.deviceMemoryGB);
-        const memGb = Number.isFinite(rawMem) && rawMem > 0 ? rawMem : 2;
+        const memGb = Number.isFinite(rawMem) && rawMem > 0 ? rawMem : Math.max(1, Math.min(32, Math.ceil(cpuCount / 2)));
 
-        const cpuBound = Math.max(1, cpuCount > 2 ? cpuCount - 1 : 1);
+        const cpuReserve = isMobileLike ? 1 : 0;
+        const cpuBound = Math.max(1, cpuCount - cpuReserve);
         let memoryCap = EXECUTOR_POOL_HARD_MAX;
         if (memGb < 2) {
           memoryCap = 2;
@@ -777,21 +781,24 @@ self.onmessage = async (event) => {
         } else if (memGb < 32) {
           memoryCap = 32;
         }
-        let slots = Math.max(EXECUTOR_POOL_MIN, Math.min(cpuBound, memoryCap, EXECUTOR_POOL_HARD_MAX));
-
         const effectiveType = String(connection.effectiveType || "").toLowerCase();
-        if (effectiveType === "slow-2g" || effectiveType === "2g") {
-          slots = 1;
-        } else if (effectiveType === "3g") {
-          slots = Math.max(1, Math.min(slots, 2));
-        }
+        const lowBattery = battery.charging === false && Number.isFinite(Number(battery.level)) && Number(battery.level) < 0.15;
+        const severeNetwork = effectiveType === "slow-2g" || effectiveType === "2g";
+        const preferredMobileMin = isMobileLike && cpuCount >= 4 && !lowBattery && !severeNetwork ? 2 : EXECUTOR_POOL_MIN;
+        let slots = Math.max(preferredMobileMin, Math.min(cpuBound, memoryCap, EXECUTOR_POOL_HARD_MAX));
 
         if (connection.saveData === true) {
-          slots = Math.max(1, Math.min(slots, 2));
+          slots = Math.max(preferredMobileMin, Math.min(slots, 2));
         }
-
-        if (battery.charging === false && Number.isFinite(Number(battery.level)) && Number(battery.level) < 0.15) {
+        if (severeNetwork) {
           slots = 1;
+        } else if (effectiveType === "3g") {
+          slots = Math.min(slots, Math.max(preferredMobileMin, 2));
+        }
+        if (lowBattery) {
+          slots = 1;
+        } else if (battery.charging === false && Number.isFinite(Number(battery.level)) && Number(battery.level) < 0.25) {
+          slots = Math.max(preferredMobileMin, Math.min(slots, 2));
         }
 
         return Math.max(EXECUTOR_POOL_MIN, Math.min(EXECUTOR_POOL_HARD_MAX, slots));
