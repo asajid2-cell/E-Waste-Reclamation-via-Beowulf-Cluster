@@ -232,6 +232,7 @@
       let totalSamples = 0;
       let maxPassSeen = -1;
       let droppedEvents = 0;
+      let payloadTrimWarningShown = false;
       let startedAtMs = 0;
 
       function log(message) {
@@ -282,6 +283,7 @@
         totalSamples = 0;
         maxPassSeen = -1;
         droppedEvents = 0;
+        payloadTrimWarningShown = false;
         lastSeq = 0;
         startedAtMs = Date.now();
         canvasWrapEl.classList.remove("active");
@@ -393,6 +395,10 @@
 
       function handleEvent(evt) {
         eventsSeen += 1;
+        if (evt && evt.payloadTruncated && !payloadTrimWarningShown) {
+          payloadTrimWarningShown = true;
+          log("Shard payloads are being trimmed by server event limits; lower tile size or increase result/event budgets.");
+        }
         if (evt.type === "shard_done") {
           completedShards = Math.max(completedShards, Number(evt.completedShards || completedShards));
           applyShardResultPayload(evt.result);

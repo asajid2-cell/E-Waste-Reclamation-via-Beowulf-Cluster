@@ -679,12 +679,14 @@ return hits;</pre>
       const SHARD_ABSOLUTE_MAX = Number.MAX_SAFE_INTEGER;
       const RAYTRACE_VIEWER_HTML_PATH = "/raytrace-viewer.html";
       const RAYTRACE_SCENE_JOBS_KEY = "cluster_raytrace_scene_jobs_v1";
+      const DEFAULT_RAYTRACE_RESULT_LIMIT_BYTES = 64 * 1024;
 
       let currentJobId = null;
       let pollTimer = null;
       let workersTimer = null;
       let stopAllInFlight = false;
       let activeRaytraceSceneKey = null;
+      let publicMaxResultBytes = DEFAULT_RAYTRACE_RESULT_LIMIT_BYTES;
       let raytraceJobsByScene = (() => {
         try {
           const parsed = JSON.parse(localStorage.getItem(RAYTRACE_SCENE_JOBS_KEY) || "{}");
@@ -777,6 +779,14 @@ return hits;</pre>
           passes,
           maxBounces,
         };
+      }
+
+      function estimateRaytraceTilePayloadBytes(settings) {
+        const tilePixels = settings.tileSize * settings.tileSize;
+        const maxValue = Math.max(255, settings.samplesPerShard * 255);
+        const avgCharsPerNumber = String(maxValue).length + 1;
+        const rgbArrayChars = tilePixels * 3 * avgCharsPerNumber;
+        return rgbArrayChars + 2048;
       }
 
       function buildRaytraceScript() {
@@ -1649,6 +1659,17 @@ return {
         }
 
         const settings = getRaytraceSettings();
+        const estimatedTilePayloadBytes = estimateRaytraceTilePayloadBytes(settings);
+        const safeBudgetBytes = Math.max(4096, Math.floor(publicMaxResultBytes * 0.9));
+        if (estimatedTilePayloadBytes > safeBudgetBytes) {
+          errorEl.textContent =
+            `Raytrace tile payload is too large for current result limit (${safeBudgetBytes} bytes). ` +
+            `Reduce tile size/samples, or increase CUSTOM_JOB_MAX_RESULT_BYTES on the server.`;
+          raytraceHintEl.textContent =
+            `Estimated tile payload ${estimatedTilePayloadBytes} bytes exceeds safe budget ${safeBudgetBytes} bytes.`;
+          raytraceHintEl.className = "hint mono warn-text";
+          return;
+        }
         const sceneKey = sceneKeyFromSettings(settings);
         const existingJobId = raytraceJobsByScene[sceneKey];
         if (existingJobId) {
@@ -1680,9 +1701,7 @@ return {
         const tilesY = Math.ceil(settings.height / settings.tileSize);
         const totalShards = Math.max(1, tilesX * tilesY * settings.passes);
         const effectiveWorkers = Math.max(2, workerCount || 0);
-        const targetShardsPerWorker = 140;
-        const targetShardCount = Math.max(1, effectiveWorkers * targetShardsPerWorker);
-        const unitsPerShard = Math.max(1, Math.ceil(totalShards / targetShardCount));
+        const unitsPerShard = 1;
         const plannedShardCount = Math.ceil(totalShards / unitsPerShard);
         const payload = {
           code: buildRaytraceScript(),
@@ -1892,6 +1911,21 @@ return {
       });
 
       const savedToken = localStorage.getItem(TOKEN_KEY);
+      fetch(withBase("/api/public-config"), { cache: "no-store" })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((cfg) => {
+          const configuredMax =
+            cfg &&
+            cfg.customJobLimits &&
+            Number.isInteger(cfg.customJobLimits.maxResultBytes) &&
+            cfg.customJobLimits.maxResultBytes > 0
+              ? cfg.customJobLimits.maxResultBytes
+              : null;
+          if (configuredMax) {
+            publicMaxResultBytes = configuredMax;
+          }
+        })
+        .catch(() => {});
       if (savedToken) {
         clientTokenEl.value = savedToken;
         checkAuth().then((ok) => {

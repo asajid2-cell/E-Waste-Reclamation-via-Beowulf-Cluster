@@ -268,7 +268,10 @@ function makeOutputEnvelope(rawOutput, wasTruncated) {
   };
 }
 
-function normalizeReturnValue(rawResult) {
+function normalizeReturnValue(rawResult, budgetBytes) {
+  const budget = Number.isFinite(Number(budgetBytes))
+    ? Math.max(8 * 1024, Number(budgetBytes))
+    : DEFAULT_RESULT_BUDGET_BYTES;
   const serialized = safeJsonStringify(rawResult);
   if (!serialized.ok) {
     return {
@@ -295,7 +298,7 @@ function normalizeReturnValue(rawResult) {
   }
 
   const serializedBytes = utf8Bytes(serialized.json);
-  if (serializedBytes > DEFAULT_RESULT_BUDGET_BYTES / 2) {
+  if (serializedBytes > Math.floor(budget * 0.9)) {
     return {
       value: {
         truncated: true,
@@ -443,7 +446,7 @@ self.onmessage = async (event) => {
     const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
     const fn = new AsyncFunction("args", "console", '"use strict";\\n' + code);
     const rawResult = await fn(args, capturedConsole);
-    const normalized = normalizeReturnValue(rawResult);
+    const normalized = normalizeReturnValue(rawResult, resultBudgetBytes);
     if (normalized.note) {
       notes.push(normalized.note);
     }
