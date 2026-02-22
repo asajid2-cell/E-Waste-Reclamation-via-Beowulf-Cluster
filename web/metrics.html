@@ -1,0 +1,707 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cluster Metrics Dashboard</title>
+    <style>
+      * { box-sizing: border-box; }
+      :root {
+        --bg: #081126;
+        --card: #11203f;
+        --line: #31558a;
+        --text: #f4f8ff;
+        --muted: #b9cbe8;
+        --ok: #58cb8b;
+        --warn: #ffbf48;
+        --err: #ff5e7a;
+        --accent: #18b6d7;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Segoe UI", Tahoma, sans-serif;
+        color: var(--text);
+        background: radial-gradient(circle at 12% 5%, #1f3f79, #081126 46%);
+      }
+      .wrap { max-width: 1240px; margin: 0 auto; padding: 1rem; }
+      .card {
+        background: color-mix(in srgb, var(--card) 90%, black);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 0.85rem;
+        margin-bottom: 0.85rem;
+        overflow: hidden;
+      }
+      .topbar { display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+      h1 { margin: 0; font-size: 1.4rem; }
+      h2 { margin: 0 0 0.65rem 0; font-size: 1.02rem; }
+      p { margin: 0.3rem 0; color: var(--muted); }
+      .mono { font-family: Consolas, "Courier New", monospace; }
+      a { color: #9ddbf7; }
+      .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem; }
+      .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.6rem; }
+      .grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.6rem; }
+      .controls { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 0.6rem; align-items: end; }
+      .control { display: grid; gap: 0.35rem; }
+      label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
+      input, select, button {
+        width: 100%;
+        border: 1px solid #4f71aa;
+        border-radius: 8px;
+        background: #0b1832;
+        color: var(--text);
+        padding: 0.55rem 0.65rem;
+      }
+      button { background: var(--accent); color: #001219; font-weight: 700; cursor: pointer; }
+      button.secondary { background: #95cde5; }
+      button.ghost { background: transparent; color: #9ed8f2; }
+      .chip { border: 1px solid #4f71aa; border-radius: 999px; padding: 0.2rem 0.55rem; color: var(--muted); font-size: 0.84rem; }
+      .ok { color: var(--ok); }
+      .warn { color: var(--warn); }
+      .err { color: var(--err); }
+      .kpi { border: 1px solid #3a5f95; border-radius: 10px; background: #0f1b36; padding: 0.6rem; }
+      .kpi .label { color: var(--muted); font-size: 0.79rem; }
+      .kpi .value { margin-top: 0.2rem; font-size: 1.22rem; font-weight: 700; overflow-wrap: anywhere; }
+      .chart-wrap { border: 1px solid #2e4b7c; border-radius: 10px; background: #09162e; padding: 0.55rem; }
+      #impactChart { width: 100%; height: 295px; display: block; }
+      .legend { margin-top: 0.45rem; display: flex; flex-wrap: wrap; gap: 0.5rem; color: var(--muted); font-size: 0.82rem; }
+      .dot { width: 11px; height: 11px; border-radius: 999px; display: inline-block; margin-right: 0.25rem; }
+      .mode-pane { border: 1px solid #2e4b7c; border-radius: 10px; background: #0a1730; padding: 0.6rem; min-height: 360px; }
+      .mode-hidden { display: none !important; }
+      .mode-grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 0.65rem; min-height: 340px; }
+      .canvas-host { border: 1px solid #2e4b7c; border-radius: 10px; background: #071127; min-height: 335px; overflow: hidden; }
+      canvas { width: 100%; height: 100%; display: block; }
+      .details { border: 1px solid #2e4b7c; border-radius: 10px; background: #0d1c39; padding: 0.55rem; overflow: auto; }
+      .details pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 0.82rem; }
+      .honeycomb-stage { position: relative; min-height: 340px; border: 1px solid #2e4b7c; border-radius: 10px; background: #071127; padding: 0.6rem; overflow: hidden; }
+      .honeycomb-lines { position: absolute; inset: 0; pointer-events: none; }
+      .honeycomb-hub {
+        position: absolute;
+        left: 50%; top: 48%; transform: translate(-50%, -50%);
+        width: 82px; height: 82px; border-radius: 999px;
+        border: 2px solid #84e5ff;
+        background: radial-gradient(circle at 35% 35%, #2dddfc, #0d4c75);
+        display: grid; place-items: center; font-weight: 800; z-index: 2;
+      }
+      .honeycomb-grid { position: relative; z-index: 3; display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 0.75rem; }
+      .hex { --heat: 0; --pulse: 1.6s; --scale: 1; background: none; border: none; padding: 0; cursor: pointer; }
+      .hex-inner {
+        width: calc(90px * var(--scale)); height: calc(80px * var(--scale)); margin: 0 auto;
+        clip-path: polygon(24% 3%, 76% 3%, 98% 50%, 76% 97%, 24% 97%, 2% 50%);
+        border: 2px solid color-mix(in srgb, #5fd3ff, #ff4d6d calc(var(--heat) * 60%));
+        background: hsl(calc(210 - (var(--heat) * 185)), 86%, calc(27% + var(--heat) * 15%));
+        color: #f6fbff; display: grid; place-items: center; text-align: center; font-size: 0.72rem; line-height: 1.2;
+      }
+      .hex.active .hex-inner { box-shadow: 0 0 0 1px #9be4ff, 0 0 16px #2fe4ff; animation: pulse var(--pulse) ease-in-out infinite; }
+      @keyframes pulse { 0% { box-shadow: 0 0 0 1px #9be4ff, 0 0 10px #2fe4ff; } 50% { box-shadow: 0 0 0 1px #c4f2ff, 0 0 18px #6df0ff; } 100% { box-shadow: 0 0 0 1px #9be4ff, 0 0 10px #2fe4ff; } }
+      .table-wrap { overflow: auto; border: 1px solid #2e4b7c; border-radius: 10px; }
+      table { width: 100%; border-collapse: collapse; min-width: 740px; background: #09162e; }
+      th, td { border-bottom: 1px solid #2b476f; padding: 0.46rem 0.5rem; font-size: 0.85rem; text-align: left; }
+      th { background: #102141; position: sticky; top: 0; }
+      .pill { border: 1px solid #4f71aa; border-radius: 999px; padding: 0.1rem 0.42rem; font-size: 0.76rem; }
+      @media (max-width: 1080px) { .controls { grid-template-columns: repeat(3, minmax(0, 1fr)); } .mode-grid { grid-template-columns: 1fr; } }
+      @media (max-width: 760px) { .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } .grid-3, .grid-2, .controls { grid-template-columns: 1fr; } #impactChart { height: 255px; } }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <div class="topbar">
+          <div>
+            <h1>Cluster Metrics Dashboard</h1>
+            <p>Live telemetry for jobs, workers, shard impact, and runtime behavior.</p>
+          </div>
+          <div class="topbar">
+            <a id="backToClientLink" href="#">Back to Client</a>
+            <span id="pollStatus" class="chip">Idle</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Auth + Polling</h2>
+        <div class="grid-3">
+          <div class="control">
+            <label for="tokenInput">Client Token</label>
+            <input id="tokenInput" class="mono" type="password" placeholder="CLIENT_API_KEY" autocomplete="off" />
+          </div>
+          <div class="control">
+            <label for="pollMsInput">Poll Every (ms)</label>
+            <input id="pollMsInput" type="number" min="250" step="250" value="1500" />
+          </div>
+          <div class="control">
+            <label>Actions</label>
+            <div class="grid-2">
+              <button id="saveTokenBtn" type="button">Save + Check</button>
+              <button id="refreshNowBtn" class="secondary" type="button">Refresh Now</button>
+            </div>
+          </div>
+        </div>
+        <p id="authMessage" class="mono">Waiting for token.</p>
+      </div>
+      <div class="card">
+        <h2>Overview</h2>
+        <div class="grid-4">
+          <div class="kpi"><div class="label">Workers Connected</div><div id="kpiWorkersConnected" class="value">-</div></div>
+          <div class="kpi"><div class="label">Queue Depth</div><div id="kpiQueueDepth" class="value">-</div></div>
+          <div class="kpi"><div class="label">Running Jobs</div><div id="kpiRunningJobs" class="value">-</div></div>
+          <div class="kpi"><div class="label">Completed Shards</div><div id="kpiCompletedShards" class="value">-</div></div>
+          <div class="kpi"><div class="label">Failed Shards</div><div id="kpiFailedShards" class="value">-</div></div>
+          <div class="kpi"><div class="label">Contributed Units</div><div id="kpiContributedUnits" class="value">-</div></div>
+          <div class="kpi"><div class="label">Tracked Workers</div><div id="kpiTrackedWorkers" class="value">-</div></div>
+          <div class="kpi"><div class="label">Last Update</div><div id="kpiUpdatedAt" class="value mono">-</div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Worker Impact Graph</h2>
+        <div class="controls">
+          <div class="control"><label for="chartMetricSelect">Metric</label><select id="chartMetricSelect"><option value="completedShards">Completed Shards</option><option value="contributedUnits">Contributed Units</option><option value="throughputUnitsPerSec">Throughput (units/s)</option><option value="inFlightCount">In-Flight Jobs</option><option value="dispatchScore">Dispatch Score</option></select></div>
+          <div class="control"><label for="chartTypeSelect">Graph Type</label><select id="chartTypeSelect"><option value="bar">Bar</option><option value="pie">Pie</option><option value="line">Line</option></select></div>
+          <div class="control"><label for="limitSelect">Workers Shown</label><select id="limitSelect"><option value="8">Top 8</option><option value="12" selected>Top 12</option><option value="16">Top 16</option><option value="24">Top 24</option><option value="999">All</option></select></div>
+          <div class="control"><label for="modeSelect">Advanced Mode</label><select id="modeSelect"><option value="force">Force-Directed Neural Map</option><option value="honeycomb">Cellular Honeycomb</option><option value="orbital">Orbital Throughput Rings</option><option value="waterfall">Shard Waterfall Timeline</option></select></div>
+          <div class="control"><label>&nbsp;</label><button id="pausePollingBtn" class="ghost" type="button">Pause Polling</button></div>
+          <div class="control"><label>Advanced Note</label><p id="modeDescription">Capability clusters with live dispatch pulses from brain to active workers.</p></div>
+        </div>
+        <div class="chart-wrap">
+          <svg id="impactChart" viewBox="0 0 960 300" preserveAspectRatio="none"></svg>
+          <div id="impactLegend" class="legend"></div>
+          <p id="impactHint">No data yet.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Advanced Visualizer</h2>
+        <div id="modeForcePane" class="mode-pane">
+          <div class="mode-grid">
+            <div class="canvas-host"><canvas id="forceCanvas"></canvas></div>
+            <aside class="details"><strong>Selected Worker / __BRAIN__ Context</strong><p id="forceSelectedHint">Click a node to inspect active shard context.</p><pre id="forceWorkerDetails">{}</pre></aside>
+          </div>
+        </div>
+        <div id="modeHoneycombPane" class="mode-pane mode-hidden">
+          <div class="mode-grid">
+            <div>
+              <div id="honeycombStage" class="honeycomb-stage">
+                <svg id="honeycombLines" class="honeycomb-lines"></svg>
+                <div id="honeycombHub" class="honeycomb-hub mono">BRAIN</div>
+                <div id="honeycombGrid" class="honeycomb-grid"></div>
+              </div>
+              <p>Heat = load, pulse speed = RTT, size = device memory.</p>
+            </div>
+            <aside class="details"><strong>Selected Worker / __BRAIN__ Context</strong><p id="honeycombSelectedHint">Click a hex worker.</p><pre id="honeycombWorkerDetails">{}</pre></aside>
+          </div>
+        </div>
+        <div id="modeOrbitalPane" class="mode-pane mode-hidden">
+          <div class="mode-grid">
+            <div class="canvas-host"><canvas id="orbitalCanvas"></canvas></div>
+            <aside class="details"><strong>Orbital Throughput Notes</strong><p>Rings map dispatch score; active workers pulse while throughput changes orbit size.</p><pre id="orbitalStats">{}</pre></aside>
+          </div>
+        </div>
+        <div id="modeWaterfallPane" class="mode-pane mode-hidden">
+          <div class="mode-grid">
+            <div class="canvas-host"><canvas id="waterfallCanvas"></canvas></div>
+            <aside class="details"><strong>Shard Waterfall Notes</strong><p>Columns are time ticks. Rows are workers. Brighter cells indicate more completed shards on that tick.</p><pre id="waterfallStats">{}</pre></aside>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Live Jobs</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Job</th><th>Op</th><th>Status</th><th>Exec</th><th>Worker</th><th>Progress</th><th>Updated</th></tr></thead>
+            <tbody id="jobsTbody"><tr><td colspan="7">No data yet.</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Worker Table</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Worker</th><th>State</th><th>Slots</th><th>Dispatch</th><th>Shards</th><th>Units</th><th>Throughput</th><th>RTT</th><th>Capabilities</th><th>Active Context</th></tr></thead>
+            <tbody id="workersTbody"><tr><td colspan="10">No data yet.</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const TOKEN_KEY = "cluster_client_token";
+      const MAX_HISTORY = 180;
+      const palette = ["#53d8fb", "#7fdc93", "#f9c74f", "#f9844a", "#f94144", "#c77dff", "#90be6d", "#4cc9f0", "#00f5d4", "#ffd166", "#ef476f", "#8338ec"];
+      const modeDescriptions = {
+        force: "Force-directed neural map. Workers cluster by capability and dispatch pulses run from brain to active workers.",
+        honeycomb: "Cellular honeycomb. Hex color tracks load, pulse speed tracks RTT, and size tracks device memory.",
+        orbital: "Orbital throughput rings. Node radius/velocity follows dispatch score and throughput.",
+        waterfall: "Shard waterfall timeline. Bright streaks indicate shard completion bursts per worker over time.",
+      };
+
+      const BASE_PATH = (() => {
+        const p = window.location.pathname.replace(/\/+$/, "");
+        if (p.endsWith("/metrics.html")) return p.slice(0, -"/metrics.html".length);
+        if (p.endsWith("/metrics")) return p.slice(0, -"/metrics".length);
+        return "";
+      })();
+      const withBase = (path) => `${BASE_PATH}${path}`;
+
+      const dom = {
+        tokenInput: document.getElementById("tokenInput"),
+        saveTokenBtn: document.getElementById("saveTokenBtn"),
+        refreshNowBtn: document.getElementById("refreshNowBtn"),
+        pollMsInput: document.getElementById("pollMsInput"),
+        pausePollingBtn: document.getElementById("pausePollingBtn"),
+        authMessage: document.getElementById("authMessage"),
+        pollStatus: document.getElementById("pollStatus"),
+        backToClientLink: document.getElementById("backToClientLink"),
+
+        chartMetricSelect: document.getElementById("chartMetricSelect"),
+        chartTypeSelect: document.getElementById("chartTypeSelect"),
+        limitSelect: document.getElementById("limitSelect"),
+        modeSelect: document.getElementById("modeSelect"),
+        modeDescription: document.getElementById("modeDescription"),
+        impactChart: document.getElementById("impactChart"),
+        impactLegend: document.getElementById("impactLegend"),
+        impactHint: document.getElementById("impactHint"),
+
+        kpiWorkersConnected: document.getElementById("kpiWorkersConnected"),
+        kpiQueueDepth: document.getElementById("kpiQueueDepth"),
+        kpiRunningJobs: document.getElementById("kpiRunningJobs"),
+        kpiCompletedShards: document.getElementById("kpiCompletedShards"),
+        kpiFailedShards: document.getElementById("kpiFailedShards"),
+        kpiContributedUnits: document.getElementById("kpiContributedUnits"),
+        kpiTrackedWorkers: document.getElementById("kpiTrackedWorkers"),
+        kpiUpdatedAt: document.getElementById("kpiUpdatedAt"),
+
+        jobsTbody: document.getElementById("jobsTbody"),
+        workersTbody: document.getElementById("workersTbody"),
+
+        modeForcePane: document.getElementById("modeForcePane"),
+        modeHoneycombPane: document.getElementById("modeHoneycombPane"),
+        modeOrbitalPane: document.getElementById("modeOrbitalPane"),
+        modeWaterfallPane: document.getElementById("modeWaterfallPane"),
+
+        forceCanvas: document.getElementById("forceCanvas"),
+        forceWorkerDetails: document.getElementById("forceWorkerDetails"),
+        forceSelectedHint: document.getElementById("forceSelectedHint"),
+
+        honeycombGrid: document.getElementById("honeycombGrid"),
+        honeycombLines: document.getElementById("honeycombLines"),
+        honeycombStage: document.getElementById("honeycombStage"),
+        honeycombHub: document.getElementById("honeycombHub"),
+        honeycombWorkerDetails: document.getElementById("honeycombWorkerDetails"),
+        honeycombSelectedHint: document.getElementById("honeycombSelectedHint"),
+
+        orbitalCanvas: document.getElementById("orbitalCanvas"),
+        orbitalStats: document.getElementById("orbitalStats"),
+        waterfallCanvas: document.getElementById("waterfallCanvas"),
+        waterfallStats: document.getElementById("waterfallStats"),
+      };
+
+      const state = { pollTimer: null, pollingPaused: false, inFlight: false, snapshot: null, history: [], selectedWorkerId: null, forceNodes: new Map(), animationFrame: null, activeMode: "force" };
+
+      const esc = (v) => String(v).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+      const num = (v) => { const n = Number(v); if (!Number.isFinite(n)) return "-"; if (Math.abs(n) >= 1e9) return `${(n / 1e9).toFixed(2)}B`; if (Math.abs(n) >= 1e6) return `${(n / 1e6).toFixed(2)}M`; if (Math.abs(n) >= 1e3) return `${(n / 1e3).toFixed(1)}k`; if (Math.abs(n) >= 10) return n.toFixed(1); return n.toFixed(2); };
+      const ms = (v) => { const n = Number(v); if (!Number.isFinite(n)) return "-"; if (n < 1000) return `${Math.round(n)}ms`; return `${(n / 1000).toFixed(2)}s`; };
+      const metricValue = (row, m) => { const n = Number(row && row[m]); return Number.isFinite(n) ? n : 0; };
+
+      const workers = () => (state.snapshot && state.snapshot.workers && Array.isArray(state.snapshot.workers.workers) ? state.snapshot.workers.workers : []);
+      const jobs = () => (state.snapshot && state.snapshot.runtime && Array.isArray(state.snapshot.runtime.jobs) ? state.snapshot.runtime.jobs : []);
+      const contexts = () => (state.snapshot && state.snapshot.runtime && state.snapshot.runtime.activeWorkerShardContexts ? state.snapshot.runtime.activeWorkerShardContexts : {});
+
+      const setPoll = (txt, cls = "") => { dom.pollStatus.textContent = txt; dom.pollStatus.className = `chip ${cls}`.trim(); };
+      const setAuth = (txt, cls = "") => { dom.authMessage.textContent = txt; dom.authMessage.className = `mono ${cls}`.trim(); };
+      const getToken = () => String(dom.tokenInput.value || "").trim();
+      const saveToken = () => { const t = getToken(); if (!t) localStorage.removeItem(TOKEN_KEY); else localStorage.setItem(TOKEN_KEY, t); };
+
+      async function apiFetch(path) {
+        const token = getToken();
+        if (!token) throw new Error("Missing client token.");
+        const res = await fetch(path, { headers: { Authorization: `Bearer ${token}` } });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) throw new Error(data && data.error ? data.error : `HTTP ${res.status}`);
+        return data;
+      }
+
+      function updateHistory(snapshot) {
+        const point = { ts: Date.now(), queueDepth: Number(snapshot.runtime && snapshot.runtime.queueDepth) || 0, workers: {} };
+        for (const w of workers()) {
+          point.workers[w.workerId] = { completedShards: Number(w.completedShards) || 0, contributedUnits: Number(w.contributedUnits) || 0, throughputUnitsPerSec: Number(w.throughputUnitsPerSec) || 0 };
+        }
+        state.history.push(point);
+        if (state.history.length > MAX_HISTORY) state.history.splice(0, state.history.length - MAX_HISTORY);
+      }
+
+      function renderKpis() {
+        const ws = state.snapshot && state.snapshot.workers ? state.snapshot.workers : { totals: {} };
+        const totals = ws.totals || {};
+        const runtime = state.snapshot && state.snapshot.runtime ? state.snapshot.runtime : {};
+        const counters = runtime.counters || {};
+        dom.kpiWorkersConnected.textContent = num(totals.workersConnected || 0);
+        dom.kpiQueueDepth.textContent = num(runtime.queueDepth || 0);
+        dom.kpiRunningJobs.textContent = num(counters.running || 0);
+        dom.kpiCompletedShards.textContent = num(totals.completedShards || 0);
+        dom.kpiFailedShards.textContent = num(totals.failedShards || 0);
+        dom.kpiContributedUnits.textContent = num(totals.contributedUnits || 0);
+        dom.kpiTrackedWorkers.textContent = num(totals.workersTracked || 0);
+        dom.kpiUpdatedAt.textContent = state.snapshot && state.snapshot.now ? new Date(state.snapshot.now).toLocaleTimeString() : "-";
+      }
+
+      function dataset() {
+        const metric = dom.chartMetricSelect.value;
+        const limit = Number(dom.limitSelect.value);
+        const rows = [...workers()].sort((a, b) => metricValue(b, metric) - metricValue(a, metric)).slice(0, Number.isFinite(limit) ? limit : 12).map((w, i) => ({ workerId: w.workerId, value: metricValue(w, metric), color: palette[i % palette.length], row: w }));
+        return { metric, rows };
+      }
+
+      function renderChart() {
+        const { metric, rows } = dataset();
+        const type = dom.chartTypeSelect.value;
+        const svg = dom.impactChart;
+        svg.innerHTML = "";
+        dom.impactLegend.innerHTML = "";
+        if (!rows.length) { dom.impactHint.textContent = "No worker data yet."; return; }
+        const max = Math.max(...rows.map((r) => r.value), 1);
+        dom.impactHint.textContent = `${metric} across ${rows.length} worker(s).`;
+        if (type === "bar") drawBar(svg, rows, max); else if (type === "pie") drawPie(svg, rows); else drawLine(svg, rows, max);
+        dom.impactLegend.innerHTML = rows.slice(0, 12).map((r) => `<span><span class="dot" style="background:${r.color}"></span>${esc(r.workerId)} (${num(r.value)})</span>`).join("");
+      }
+      function drawBar(svg, rows, max) {
+        const w = 960, h = 300, left = 70, right = 20, top = 18, bottom = 54;
+        const innerW = w - left - right, innerH = h - top - bottom, barW = innerW / Math.max(rows.length, 1);
+        let html = `<rect x="0" y="0" width="${w}" height="${h}" fill="#08132a"/><line x1="${left}" y1="${h - bottom}" x2="${w - right}" y2="${h - bottom}" stroke="#3a5f95"/><line x1="${left}" y1="${top}" x2="${left}" y2="${h - bottom}" stroke="#3a5f95"/>`;
+        for (let i = 0; i <= 4; i += 1) {
+          const y = top + (innerH * i) / 4;
+          const v = max - (max * i) / 4;
+          html += `<line x1="${left}" y1="${y}" x2="${w - right}" y2="${y}" stroke="#1f3a66"/><text x="${left - 8}" y="${y + 4}" text-anchor="end" fill="#9fb9e3" font-size="10">${esc(num(v))}</text>`;
+        }
+        rows.forEach((r, i) => {
+          const x = left + i * barW + 5, bh = Math.max(2, (r.value / max) * innerH), y = h - bottom - bh, bw = Math.max(2, barW - 10);
+          const lbl = r.workerId.length > 12 ? `${r.workerId.slice(0, 12)}..` : r.workerId;
+          html += `<rect x="${x}" y="${y}" width="${bw}" height="${bh}" fill="${r.color}"/><text x="${x + bw / 2}" y="${h - bottom + 14}" text-anchor="middle" fill="#bdd2f5" font-size="10">${esc(lbl)}</text>`;
+        });
+        svg.innerHTML = html;
+      }
+
+      function drawPie(svg, rows) {
+        const w = 960, h = 300, cx = 190, cy = 150, radius = 114;
+        const total = rows.reduce((s, r) => s + Math.max(0, r.value), 0) || 1;
+        let a = -Math.PI / 2;
+        let html = `<rect x="0" y="0" width="${w}" height="${h}" fill="#08132a"/>`;
+        rows.forEach((r, i) => {
+          const part = Math.max(0, r.value) / total, sweep = part * Math.PI * 2, end = a + sweep;
+          const x1 = cx + radius * Math.cos(a), y1 = cy + radius * Math.sin(a), x2 = cx + radius * Math.cos(end), y2 = cy + radius * Math.sin(end);
+          const large = sweep > Math.PI ? 1 : 0;
+          html += `<path d="M ${cx} ${cy} L ${x1} ${y1} A ${radius} ${radius} 0 ${large} 1 ${x2} ${y2} Z" fill="${r.color}"/>`;
+          a = end;
+          if (i < 12) html += `<rect x="374" y="${22 + i * 20}" width="12" height="12" fill="${r.color}"/><text x="392" y="${32 + i * 20}" fill="#d3e3ff" font-size="12">${esc(r.workerId)} - ${esc(num(r.value))}</text>`;
+        });
+        html += `<circle cx="${cx}" cy="${cy}" r="58" fill="#08132a" stroke="#3a5f95"/><text x="${cx}" y="${cy - 3}" text-anchor="middle" fill="#e0ecff" font-size="12">Total</text><text x="${cx}" y="${cy + 18}" text-anchor="middle" fill="#7fe0ff" font-size="15">${esc(num(total))}</text>`;
+        svg.innerHTML = html;
+      }
+
+      function drawLine(svg, rows, max) {
+        const w = 960, h = 300, left = 65, right = 22, top = 18, bottom = 42, innerW = w - left - right, innerH = h - top - bottom;
+        const pts = rows.map((r, i) => ({ x: left + (i / Math.max(rows.length - 1, 1)) * innerW, y: top + innerH - (r.value / Math.max(max, 1)) * innerH, r }));
+        const poly = pts.map((p) => `${p.x},${p.y}`).join(" ");
+        let html = `<rect x="0" y="0" width="${w}" height="${h}" fill="#08132a"/><line x1="${left}" y1="${h - bottom}" x2="${w - right}" y2="${h - bottom}" stroke="#3a5f95"/><line x1="${left}" y1="${top}" x2="${left}" y2="${h - bottom}" stroke="#3a5f95"/><polyline points="${poly}" fill="none" stroke="#6de1ff" stroke-width="2.5"/>`;
+        pts.forEach((p, i) => { html += `<circle cx="${p.x}" cy="${p.y}" r="4" fill="${rows[i].color}"/><text x="${p.x}" y="${h - bottom + 14}" text-anchor="middle" fill="#bdd2f5" font-size="10">${esc(p.r.workerId.slice(0, 10))}</text>`; });
+        svg.innerHTML = html;
+      }
+
+      function renderJobs() {
+        const rows = jobs();
+        if (!rows.length) { dom.jobsTbody.innerHTML = `<tr><td colspan="7">No visible jobs.</td></tr>`; return; }
+        dom.jobsTbody.innerHTML = rows.slice(0, 80).map((j) => {
+          const cls = j.status === "failed" ? "err" : j.status === "done" ? "ok" : "warn";
+          let progress = "-";
+          if (j.executionModel === "sharded") progress = `${Number(j.completedShards || 0)}/${Number(j.totalShards || 0)} (failed:${Number(j.failedShards || 0)})`;
+          return `<tr><td class="mono">${esc(j.jobId || "-")}</td><td>${esc(j.op || "-")}</td><td><span class="pill ${cls}">${esc(j.status || "-")}</span></td><td>${esc(j.executionModel || "-")}</td><td class="mono">${esc(j.assignedWorkerId || "-")}</td><td>${esc(progress)}</td><td class="mono">${esc(j.updatedAt ? new Date(j.updatedAt).toLocaleTimeString() : "-")}</td></tr>`;
+        }).join("");
+      }
+
+      function renderWorkers() {
+        const rows = workers();
+        const c = contexts();
+        if (!rows.length) { dom.workersTbody.innerHTML = `<tr><td colspan="10">No workers tracked.</td></tr>`; return; }
+        dom.workersTbody.innerHTML = rows.map((w) => {
+          const caps = w.capabilities || {};
+          const ctx = (c[w.workerId] || [])[0] || null;
+          const cls = w.connected ? (Number(w.inFlightCount || 0) > 0 ? "warn" : "ok") : "err";
+          const capText = `${Number(caps.hardwareConcurrency || 0)}t / ${Number(caps.deviceMemoryGB || 0)}GB / ${caps.effectiveType || "?"}`;
+          const ctxText = ctx ? `shard ${ctx.shardIndex}/${ctx.totalShards} attempt ${ctx.attempt}` : Number(w.inFlightCount || 0) > 0 ? "in-flight" : "-";
+          return `<tr><td class="mono">${esc(w.workerId)}</td><td><span class="pill ${cls}">${esc(w.state || "-")}</span></td><td>${esc(`${Number(w.inFlightCount || 0)}/${Number(w.maxSlots || 1)} (free:${Number(w.availableSlots || 0)})`)}</td><td>${esc(num(w.dispatchScore))}</td><td>${esc(num(w.completedShards))}</td><td>${esc(num(w.contributedUnits))}</td><td>${esc(num(w.throughputUnitsPerSec))}</td><td>${esc(ms(caps.rttMs || 0))}</td><td>${esc(capText)}</td><td class="mono">${esc(ctxText)}</td></tr>`;
+        }).join("");
+      }
+
+      function resizeCanvas(canvas) {
+        const r = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const width = Math.max(1, Math.floor(r.width * dpr));
+        const height = Math.max(1, Math.floor(r.height * dpr));
+        if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+        return { width, height, dpr };
+      }
+
+      function selectedWorkerPayload() {
+        const rows = workers();
+        if (!rows.length) return null;
+        const id = state.selectedWorkerId || rows[0].workerId;
+        state.selectedWorkerId = id;
+        const worker = rows.find((r) => r.workerId === id) || rows[0];
+        return { worker, activeContexts: contexts()[worker.workerId] || [] };
+      }
+
+      function showForceDetails() {
+        const payload = selectedWorkerPayload();
+        if (!payload) { dom.forceSelectedHint.textContent = "No worker selected."; dom.forceWorkerDetails.textContent = "{}"; return; }
+        dom.forceSelectedHint.textContent = `Selected: ${payload.worker.workerId}`;
+        dom.forceWorkerDetails.textContent = JSON.stringify(payload, null, 2);
+      }
+
+      function showHoneycombDetails() {
+        const payload = selectedWorkerPayload();
+        if (!payload) { dom.honeycombSelectedHint.textContent = "No worker selected."; dom.honeycombWorkerDetails.textContent = "{}"; return; }
+        dom.honeycombSelectedHint.textContent = `Selected: ${payload.worker.workerId}`;
+        dom.honeycombWorkerDetails.textContent = JSON.stringify(payload, null, 2);
+      }
+      function workerTarget(worker, w, h) {
+        const caps = worker.capabilities || {};
+        const mem = Number(caps.deviceMemoryGB || 0), threads = Number(caps.hardwareConcurrency || 0);
+        if (mem >= 8) return { x: w * 0.77, y: h * 0.28 };
+        if (threads >= 8) return { x: w * 0.24, y: h * 0.72 };
+        return { x: w * 0.53, y: h * 0.5 };
+      }
+
+      function updateForceNodes(rows, w, h) {
+        const cx = w * 0.5, cy = h * 0.5, nodes = state.forceNodes;
+        const ids = new Set(rows.map((r) => r.workerId));
+        for (const id of nodes.keys()) if (!ids.has(id)) nodes.delete(id);
+        rows.forEach((r, i) => {
+          if (!nodes.has(r.workerId)) {
+            const seed = (i + 1) * 73.123;
+            nodes.set(r.workerId, { x: cx + Math.cos(seed) * (60 + (i % 6) * 20), y: cy + Math.sin(seed) * (45 + (i % 5) * 18), vx: 0, vy: 0, pulse: Math.random() });
+          }
+        });
+        const pairs = rows.map((r) => ({ w: r, n: nodes.get(r.workerId) }));
+        for (let i = 0; i < pairs.length; i += 1) {
+          const p = pairs[i], t = workerTarget(p.w, w, h);
+          p.n.vx += (t.x - p.n.x) * 0.005 + (cx - p.n.x) * 0.0015;
+          p.n.vy += (t.y - p.n.y) * 0.005 + (cy - p.n.y) * 0.0015;
+        }
+        for (let i = 0; i < pairs.length; i += 1) for (let j = i + 1; j < pairs.length; j += 1) {
+          const a = pairs[i].n, b = pairs[j].n;
+          let dx = a.x - b.x, dy = a.y - b.y;
+          const d2 = dx * dx + dy * dy + 0.001, rep = 28000 / d2, d = Math.sqrt(d2);
+          dx /= d; dy /= d;
+          a.vx += dx * rep * 0.0006; a.vy += dy * rep * 0.0006;
+          b.vx -= dx * rep * 0.0006; b.vy -= dy * rep * 0.0006;
+        }
+        for (const p of pairs) {
+          const n = p.n;
+          n.vx *= 0.92; n.vy *= 0.92; n.x += n.vx; n.y += n.vy;
+          n.x = Math.max(18, Math.min(w - 18, n.x)); n.y = Math.max(18, Math.min(h - 18, n.y));
+          n.pulse = (n.pulse + 0.018) % 1;
+        }
+      }
+
+      function drawForce(ts = performance.now()) {
+        if (state.activeMode !== "force") return;
+        const rows = workers();
+        const { width, height, dpr } = resizeCanvas(dom.forceCanvas);
+        const ctx = dom.forceCanvas.getContext("2d");
+        if (!ctx) return;
+        ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, width, height); ctx.scale(dpr, dpr);
+        const w = width / dpr, h = height / dpr, cx = w * 0.5, cy = h * 0.5;
+        const g = ctx.createLinearGradient(0, 0, w, h); g.addColorStop(0, "#061129"); g.addColorStop(1, "#0f2451"); ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+        updateForceNodes(rows, w, h);
+        const c = contexts();
+        for (const row of rows) {
+          const n = state.forceNodes.get(row.workerId); if (!n) continue;
+          const active = Number(row.inFlightCount || 0) > 0 || (c[row.workerId] || []).length > 0;
+          ctx.strokeStyle = active ? "rgba(103,224,255,0.55)" : "rgba(76,114,178,0.33)"; ctx.lineWidth = active ? 1.5 : 1;
+          ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(n.x, n.y); ctx.stroke();
+          if (active) { const t = (n.pulse + ts * 0.00035) % 1, px = cx + (n.x - cx) * t, py = cy + (n.y - cy) * t; ctx.fillStyle = "#8ff0ff"; ctx.beginPath(); ctx.arc(px, py, 3.2, 0, Math.PI * 2); ctx.fill(); }
+        }
+        for (const row of rows) {
+          const n = state.forceNodes.get(row.workerId); if (!n) continue;
+          const caps = row.capabilities || {}, r = 7 + Math.min(9, Number(caps.deviceMemoryGB || 0) / 2 + Number(caps.hardwareConcurrency || 0) / 12);
+          const selected = state.selectedWorkerId === row.workerId, active = Number(row.inFlightCount || 0) > 0;
+          ctx.fillStyle = active ? "#4ce3a0" : "#4db1ff"; ctx.strokeStyle = selected ? "#ffd166" : "#cfe5ff"; ctx.lineWidth = selected ? 2.2 : 1.1;
+          ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+          ctx.fillStyle = "#d7e8ff"; ctx.font = "10px Consolas"; const label = row.workerId.length > 12 ? `${row.workerId.slice(0, 12)}..` : row.workerId; ctx.fillText(label, n.x + r + 3, n.y + 3);
+        }
+        const pulseR = 22 + Math.sin(ts * 0.004) * 4;
+        ctx.fillStyle = "#1f4e79"; ctx.strokeStyle = "#8adfff"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(cx, cy, pulseR, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); ctx.fillStyle = "#f1fbff"; ctx.font = "bold 11px Segoe UI"; ctx.fillText("BRAIN", cx - 19, cy + 4);
+        showForceDetails();
+        state.animationFrame = requestAnimationFrame(drawForce);
+      }
+
+      function drawOrbital(ts = performance.now()) {
+        if (state.activeMode !== "orbital") return;
+        const rows = [...workers()].sort((a, b) => Number(b.dispatchScore || 0) - Number(a.dispatchScore || 0));
+        const { width, height, dpr } = resizeCanvas(dom.orbitalCanvas);
+        const ctx = dom.orbitalCanvas.getContext("2d");
+        if (!ctx) return;
+        ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, width, height); ctx.scale(dpr, dpr);
+        const w = width / dpr, h = height / dpr, cx = w * 0.5, cy = h * 0.5;
+        const bg = ctx.createLinearGradient(0, 0, w, h); bg.addColorStop(0, "#071127"); bg.addColorStop(1, "#132d57"); ctx.fillStyle = bg; ctx.fillRect(0, 0, w, h);
+        rows.forEach((row, i) => {
+          const baseR = 60 + i * 14, radius = Math.min(baseR, Math.min(w, h) * 0.45);
+          ctx.strokeStyle = "rgba(112,160,220,0.3)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(cx, cy, radius, 0, Math.PI * 2); ctx.stroke();
+          const speed = 0.0003 + Number(row.dispatchScore || 1) * 0.00007, theta = ts * speed + i * 1.17;
+          const x = cx + Math.cos(theta) * radius, y = cy + Math.sin(theta) * radius, thr = Number(row.throughputUnitsPerSec || 0), size = 4 + Math.min(11, thr / 80), active = Number(row.inFlightCount || 0) > 0;
+          ctx.fillStyle = active ? "#5eff9f" : palette[i % palette.length]; ctx.beginPath(); ctx.arc(x, y, size, 0, Math.PI * 2); ctx.fill();
+          if (active) { ctx.strokeStyle = "rgba(106,255,181,0.42)"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, size + 4 + Math.sin(ts * 0.004 + i) * 2, 0, Math.PI * 2); ctx.stroke(); }
+        });
+        ctx.fillStyle = "#8be6ff"; ctx.beginPath(); ctx.arc(cx, cy, 28, 0, Math.PI * 2); ctx.fill(); ctx.fillStyle = "#07203f"; ctx.font = "bold 12px Segoe UI"; ctx.fillText("BRAIN", cx - 21, cy + 4);
+        const totals = state.snapshot && state.snapshot.workers ? state.snapshot.workers.totals || {} : {};
+        dom.orbitalStats.textContent = JSON.stringify({ workers: rows.length, workersConnected: totals.workersConnected || 0, completedShards: totals.completedShards || 0, contributedUnits: totals.contributedUnits || 0, activeWorkers: rows.filter((w) => Number(w.inFlightCount || 0) > 0).length }, null, 2);
+        state.animationFrame = requestAnimationFrame(drawOrbital);
+      }
+
+      function drawWaterfall() {
+        const rows = [...workers()].sort((a, b) => Number(b.completedShards || 0) - Number(a.completedShards || 0)).slice(0, 14);
+        const { width, height, dpr } = resizeCanvas(dom.waterfallCanvas);
+        const ctx = dom.waterfallCanvas.getContext("2d");
+        if (!ctx) return;
+        ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, width, height); ctx.scale(dpr, dpr);
+        const w = width / dpr, h = height / dpr, hist = state.history, cols = Math.max(1, Math.min(hist.length - 1, 150));
+        const left = 120, right = 14, top = 16, bottom = 22, gw = Math.max(1, w - left - right), gh = Math.max(1, h - top - bottom), rowH = gh / Math.max(rows.length, 1), colW = gw / Math.max(cols, 1);
+        ctx.fillStyle = "#071127"; ctx.fillRect(0, 0, w, h);
+        let maxDelta = 1;
+        const deltas = {};
+        for (const row of rows) {
+          const id = row.workerId, arr = [];
+          for (let i = Math.max(1, hist.length - cols); i < hist.length; i += 1) {
+            const prev = hist[i - 1] && hist[i - 1].workers[id] ? hist[i - 1].workers[id].completedShards : 0;
+            const curr = hist[i] && hist[i].workers[id] ? hist[i].workers[id].completedShards : prev;
+            const d = Math.max(0, curr - prev);
+            arr.push(d); if (d > maxDelta) maxDelta = d;
+          }
+          deltas[id] = arr;
+        }
+        rows.forEach((row, r) => {
+          const y = top + r * rowH, arr = deltas[row.workerId] || [];
+          arr.forEach((d, c) => {
+            const x = left + c * colW, t = Math.max(0, Math.min(1, d / maxDelta)), hue = 210 - t * 210;
+            ctx.fillStyle = `hsl(${hue}, 90%, ${16 + t * 46}%)`; ctx.fillRect(x, y, Math.max(1, colW - 1), Math.max(1, rowH - 1));
+          });
+          ctx.fillStyle = "#d1e3ff"; ctx.font = "10px Consolas"; const lbl = row.workerId.length > 14 ? `${row.workerId.slice(0, 14)}..` : row.workerId; ctx.fillText(lbl, 8, y + rowH * 0.62);
+        });
+        ctx.strokeStyle = "#3a5f95"; ctx.strokeRect(left, top, gw, gh);
+        ctx.fillStyle = "#a7c3eb"; ctx.font = "10px Segoe UI"; ctx.fillText("older", left, h - 6); ctx.fillText("newer", left + gw - 34, h - 6);
+        dom.waterfallStats.textContent = JSON.stringify({ rows: rows.length, columns: cols, maxShardDelta: maxDelta, historyTicks: hist.length }, null, 2);
+      }
+
+      function connectHoneycombLines() {
+        const stage = dom.honeycombStage, lines = dom.honeycombLines, hub = dom.honeycombHub;
+        const active = [...dom.honeycombGrid.querySelectorAll(".hex.active")];
+        const sr = stage.getBoundingClientRect(), hr = hub.getBoundingClientRect();
+        const hx = hr.left + hr.width / 2 - sr.left, hy = hr.top + hr.height / 2 - sr.top;
+        lines.setAttribute("viewBox", `0 0 ${Math.max(1, sr.width)} ${Math.max(1, sr.height)}`);
+        lines.setAttribute("width", `${Math.max(1, sr.width)}`); lines.setAttribute("height", `${Math.max(1, sr.height)}`);
+        lines.innerHTML = active.map((cell) => { const r = cell.getBoundingClientRect(), x = r.left + r.width / 2 - sr.left, y = r.top + r.height / 2 - sr.top; return `<line x1="${hx}" y1="${hy}" x2="${x}" y2="${y}" stroke="rgba(123,226,255,0.35)" stroke-width="1.2"/>`; }).join("");
+      }
+
+      function drawHoneycomb() {
+        const rows = workers(), c = contexts();
+        if (!rows.length) { dom.honeycombGrid.innerHTML = `<p class="mono">No workers connected.</p>`; dom.honeycombLines.innerHTML = ""; return; }
+        const maxThr = Math.max(1, ...rows.map((r) => Number(r.throughputUnitsPerSec || 0)));
+        dom.honeycombGrid.innerHTML = rows.map((row) => {
+          const caps = row.capabilities || {}, load = Number(row.maxSlots || 1) > 0 ? Number(row.inFlightCount || 0) / Number(row.maxSlots || 1) : 0, thrNorm = Number(row.throughputUnitsPerSec || 0) / maxThr;
+          const heat = Math.max(0, Math.min(1, load * 0.72 + thrNorm * 0.28)), rtt = Math.max(80, Number(caps.rttMs || 450)), pulse = Math.max(0.45, Math.min(3.2, rtt / 380)), scale = Math.max(0.82, Math.min(1.45, 0.82 + Number(caps.deviceMemoryGB || 0) * 0.06));
+          const active = Number(row.inFlightCount || 0) > 0 || (c[row.workerId] || []).length > 0, short = row.workerId.length > 10 ? `${row.workerId.slice(0, 10)}..` : row.workerId;
+          return `<button class="hex ${active ? "active" : ""}" data-worker-id="${esc(row.workerId)}" style="--heat:${heat.toFixed(3)}; --pulse:${pulse.toFixed(2)}s; --scale:${scale.toFixed(2)};"><div class="hex-inner"><div class="mono">${esc(short)}</div><div>${esc(`${Number(row.inFlightCount || 0)}/${Number(row.maxSlots || 1)}`)}</div></div></button>`;
+        }).join("");
+        dom.honeycombGrid.querySelectorAll(".hex").forEach((el) => el.addEventListener("click", () => { const wid = el.getAttribute("data-worker-id"); if (wid) { state.selectedWorkerId = wid; showHoneycombDetails(); } }));
+        showHoneycombDetails();
+        requestAnimationFrame(connectHoneycombLines);
+      }
+
+      function setMode(mode) {
+        state.activeMode = mode;
+        dom.modeDescription.textContent = modeDescriptions[mode] || "";
+        dom.modeForcePane.classList.toggle("mode-hidden", mode !== "force");
+        dom.modeHoneycombPane.classList.toggle("mode-hidden", mode !== "honeycomb");
+        dom.modeOrbitalPane.classList.toggle("mode-hidden", mode !== "orbital");
+        dom.modeWaterfallPane.classList.toggle("mode-hidden", mode !== "waterfall");
+        if (state.animationFrame) { cancelAnimationFrame(state.animationFrame); state.animationFrame = null; }
+        if (mode === "force") drawForce(); else if (mode === "orbital") drawOrbital(); else if (mode === "honeycomb") drawHoneycomb(); else drawWaterfall();
+      }
+
+      function renderAll() {
+        renderKpis(); renderChart(); renderJobs(); renderWorkers();
+        if (state.activeMode === "honeycomb") drawHoneycomb(); else if (state.activeMode === "waterfall") drawWaterfall(); else if (state.activeMode === "force") showForceDetails();
+      }
+
+      async function pullSnapshot() {
+        if (state.inFlight) return;
+        state.inFlight = true;
+        try {
+          setPoll("Polling...", "warn");
+          const data = await apiFetch(withBase("/api/metrics/cluster"));
+          state.snapshot = data;
+          updateHistory(data);
+          renderAll();
+          setPoll("Live", "ok");
+          setAuth(`Authenticated. Last pull: ${new Date().toLocaleTimeString()} | workers=${workers().length}`, "ok");
+        } catch (e) {
+          setPoll("Error", "err");
+          setAuth(`Fetch failed: ${e.message}`, "err");
+        } finally {
+          state.inFlight = false;
+        }
+      }
+
+      function restartPolling() {
+        if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+        if (state.pollingPaused) return;
+        const every = Math.max(250, Number(dom.pollMsInput.value) || 1500);
+        dom.pollMsInput.value = String(every);
+        state.pollTimer = setInterval(() => pullSnapshot(), every);
+      }
+
+      function bind() {
+        dom.saveTokenBtn.addEventListener("click", async () => { saveToken(); await pullSnapshot(); restartPolling(); });
+        dom.refreshNowBtn.addEventListener("click", async () => { await pullSnapshot(); });
+        dom.pollMsInput.addEventListener("change", restartPolling);
+        dom.pausePollingBtn.addEventListener("click", () => {
+          state.pollingPaused = !state.pollingPaused;
+          dom.pausePollingBtn.textContent = state.pollingPaused ? "Resume Polling" : "Pause Polling";
+          if (state.pollingPaused) { if (state.pollTimer) clearInterval(state.pollTimer); state.pollTimer = null; setPoll("Paused", "warn"); }
+          else { restartPolling(); pullSnapshot(); }
+        });
+        dom.chartMetricSelect.addEventListener("change", renderChart);
+        dom.chartTypeSelect.addEventListener("change", renderChart);
+        dom.limitSelect.addEventListener("change", renderChart);
+        dom.modeSelect.addEventListener("change", () => setMode(dom.modeSelect.value));
+        dom.forceCanvas.addEventListener("click", (ev) => {
+          const rows = workers(); if (!rows.length) return;
+          const rect = dom.forceCanvas.getBoundingClientRect(), x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+          let bestId = null, best = Number.POSITIVE_INFINITY;
+          for (const r of rows) {
+            const n = state.forceNodes.get(r.workerId); if (!n) continue;
+            const d = Math.hypot(n.x - x, n.y - y);
+            if (d < best) { best = d; bestId = r.workerId; }
+          }
+          if (bestId && best < 26) { state.selectedWorkerId = bestId; showForceDetails(); }
+        });
+        window.addEventListener("resize", () => { if (state.activeMode === "honeycomb") requestAnimationFrame(connectHoneycombLines); if (state.activeMode === "waterfall") drawWaterfall(); });
+      }
+
+      function bootstrap() {
+        const saved = localStorage.getItem(TOKEN_KEY);
+        if (saved) { dom.tokenInput.value = saved; setAuth("Loaded saved client token from browser storage.", "ok"); }
+        dom.backToClientLink.href = withBase("/client");
+        bind();
+        setMode(dom.modeSelect.value);
+        pullSnapshot();
+        restartPolling();
+      }
+
+      bootstrap();
+    </script>
+  </body>
+</html>

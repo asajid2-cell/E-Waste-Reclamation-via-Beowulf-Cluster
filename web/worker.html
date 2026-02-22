@@ -195,6 +195,8 @@
       const HEARTBEAT_INTERVAL_MS = 20_000;
       const MAX_CLOCK_SKEW_MS = 30_000;
       const DEFAULT_MAX_RESULT_BYTES = 64 * 1024;
+      const EXECUTOR_POOL_HARD_MAX = 8;
+      const EXECUTOR_POOL_MIN = 1;
       const BASE_PATH = (() => {
         const path = window.location.pathname.replace(/\/+$/, "");
         if (path.endsWith("/worker")) {
@@ -571,6 +573,11 @@ self.onmessage = async (event) => {
       let batterySnapshot = null;
       let capabilitySnapshot = null;
       let activeJobCount = 0;
+      let executorRunnerUrl = null;
+      let executorPool = [];
+      let executorQueue = [];
+      let executorCounter = 0;
+      let executorTargetSize = 1;
 
       workerIdEl.textContent = workerId;
       inviteStateEl.textContent = inviteToken ? "present" : "missing";
@@ -736,11 +743,266 @@ self.onmessage = async (event) => {
         }
 
         capabilitySnapshot = Object.keys(snapshot).length > 0 ? snapshot : null;
+        syncExecutorPoolSize();
         return capabilitySnapshot;
       }
 
       function getCapabilitiesForWire() {
         return updateCapabilitySnapshot();
+      }
+
+      function deriveExecutorPoolSize() {
+        const caps = capabilitySnapshot || {};
+        const connection = caps.connection && typeof caps.connection === "object" ? caps.connection : {};
+        const battery = caps.battery && typeof caps.battery === "object" ? caps.battery : {};
+
+        const rawCpu = Number(caps.hardwareConcurrency);
+        const cpuCount = Number.isFinite(rawCpu) && rawCpu > 0 ? Math.round(rawCpu) : 2;
+        const rawMem = Number(caps.deviceMemoryGB);
+        const memGb = Number.isFinite(rawMem) && rawMem > 0 ? rawMem : 2;
+
+        const cpuBound = Math.max(1, cpuCount > 2 ? cpuCount - 1 : 1);
+        const memBound = Math.max(1, Math.floor(memGb));
+        let slots = Math.max(EXECUTOR_POOL_MIN, Math.min(cpuBound, memBound, EXECUTOR_POOL_HARD_MAX));
+
+        const effectiveType = String(connection.effectiveType || "").toLowerCase();
+        if (effectiveType === "slow-2g" || effectiveType === "2g") {
+          slots = 1;
+        } else if (effectiveType === "3g") {
+          slots = Math.max(1, Math.min(slots, 2));
+        }
+
+        if (connection.saveData === true) {
+          slots = Math.max(1, Math.min(slots, 2));
+        }
+
+        if (battery.charging === false && Number.isFinite(Number(battery.level)) && Number(battery.level) < 0.15) {
+          slots = 1;
+        }
+
+        return Math.max(EXECUTOR_POOL_MIN, Math.min(EXECUTOR_POOL_HARD_MAX, slots));
+      }
+
+      function clearExecutorTimer(task) {
+        if (!task || !task.timeoutState) {
+          return;
+        }
+        if (task.timeoutState.handle) {
+          clearTimeout(task.timeoutState.handle);
+          task.timeoutState.handle = null;
+        }
+      }
+
+      function buildExecutorTimeoutResult(timeoutMs, args) {
+        return {
+          ok: false,
+          exitCode: 124,
+          durationMs: timeoutMs,
+          returnType: "none",
+          returnValue: null,
+          argsType: args === null ? "null" : Array.isArray(args) ? "array" : typeof args,
+          logs: [],
+          output: {
+            text: "",
+            truncated: false,
+            bytes: 0,
+          },
+          error: {
+            message: "Execution timeout exceeded",
+            stack: null,
+          },
+          notes: [],
+        };
+      }
+
+      function buildExecutorWorkerErrorResult(args, message) {
+        return {
+          ok: false,
+          exitCode: 70,
+          durationMs: 0,
+          returnType: "none",
+          returnValue: null,
+          argsType: args === null ? "null" : Array.isArray(args) ? "array" : typeof args,
+          logs: [],
+          output: {
+            text: "",
+            truncated: false,
+            bytes: 0,
+          },
+          error: {
+            message,
+            stack: null,
+          },
+          notes: [],
+        };
+      }
+
+      function getExecutorRunnerUrl() {
+        if (!executorRunnerUrl) {
+          const blob = new Blob([EXECUTOR_SOURCE], { type: "application/javascript" });
+          executorRunnerUrl = URL.createObjectURL(blob);
+        }
+        return executorRunnerUrl;
+      }
+
+      function installExecutorListeners(handle, workerRef) {
+        const ref = workerRef || handle.worker;
+        ref.addEventListener("message", (event) => {
+          if (handle.worker !== ref) {
+            return;
+          }
+          const task = handle.task;
+          if (!task) {
+            return;
+          }
+          const message = event.data || {};
+          if (message.__cluster_exec_done__ !== true) {
+            return;
+          }
+          clearExecutorTimer(task);
+          const result = Object.prototype.hasOwnProperty.call(message, "result")
+            ? message.result
+            : buildExecutorWorkerErrorResult(task.args, "Execution worker returned malformed response");
+          handle.busy = false;
+          handle.task = null;
+          task.resolve(result);
+          dispatchExecutorQueue();
+        });
+
+        ref.addEventListener("error", () => {
+          if (handle.worker !== ref) {
+            return;
+          }
+          const task = handle.task;
+          if (task) {
+            clearExecutorTimer(task);
+            task.resolve(buildExecutorWorkerErrorResult(task.args, "Execution worker crashed"));
+          }
+          try {
+            ref.terminate();
+          } catch (_err) {
+            // ignore
+          }
+          handle.worker = new Worker(getExecutorRunnerUrl());
+          handle.busy = false;
+          handle.task = null;
+          installExecutorListeners(handle, handle.worker);
+          dispatchExecutorQueue();
+        });
+      }
+
+      function createExecutorHandle() {
+        const handle = {
+          id: ++executorCounter,
+          worker: new Worker(getExecutorRunnerUrl()),
+          busy: false,
+          task: null,
+        };
+        installExecutorListeners(handle, handle.worker);
+        return handle;
+      }
+
+      function destroyExecutorHandle(handle) {
+        if (!handle) {
+          return;
+        }
+        if (handle.task) {
+          clearExecutorTimer(handle.task);
+          handle.task.resolve(buildExecutorWorkerErrorResult(handle.task.args, "Execution worker recycled"));
+          handle.task = null;
+        }
+        handle.busy = false;
+        try {
+          handle.worker.terminate();
+        } catch (_err) {
+          // ignore
+        }
+      }
+
+      function scheduleTaskTimeout(handle, task) {
+        const timeoutMs = Number(task.timeoutMs);
+        if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+          return;
+        }
+        const MAX_TIMER_MS = 2147483647;
+        const timeoutState = {
+          deadlineMs: Date.now() + timeoutMs,
+          handle: null,
+        };
+        task.timeoutState = timeoutState;
+        const tick = () => {
+          if (handle.task !== task || !timeoutState) {
+            return;
+          }
+          const remainingMs = timeoutState.deadlineMs - Date.now();
+          if (remainingMs <= 0) {
+            const timedOutTask = handle.task;
+            if (timedOutTask) {
+              clearExecutorTimer(timedOutTask);
+              timedOutTask.resolve(buildExecutorTimeoutResult(timeoutMs, timedOutTask.args));
+            }
+            try {
+              handle.worker.terminate();
+            } catch (_err) {
+              // ignore
+            }
+            handle.worker = new Worker(getExecutorRunnerUrl());
+            handle.busy = false;
+            handle.task = null;
+            installExecutorListeners(handle, handle.worker);
+            dispatchExecutorQueue();
+            return;
+          }
+          timeoutState.handle = setTimeout(tick, Math.min(remainingMs, MAX_TIMER_MS));
+        };
+        tick();
+      }
+
+      function dispatchExecutorQueue() {
+        if (!executorQueue.length) {
+          return;
+        }
+        for (const handle of executorPool) {
+          if (!executorQueue.length) {
+            return;
+          }
+          if (handle.busy) {
+            continue;
+          }
+          const task = executorQueue.shift();
+          if (!task) {
+            return;
+          }
+          handle.busy = true;
+          handle.task = task;
+          scheduleTaskTimeout(handle, task);
+          handle.worker.postMessage({
+            code: task.code,
+            args: task.args,
+            resultBudgetBytes: task.resultBudgetBytes,
+          });
+        }
+      }
+
+      function syncExecutorPoolSize() {
+        const previousTarget = executorTargetSize;
+        const nextSize = deriveExecutorPoolSize();
+        executorTargetSize = nextSize;
+
+        while (executorPool.length < executorTargetSize) {
+          executorPool.push(createExecutorHandle());
+        }
+        while (executorPool.length > executorTargetSize) {
+          const idx = executorPool.findIndex((entry) => !entry.busy);
+          if (idx === -1) {
+            break;
+          }
+          const [removed] = executorPool.splice(idx, 1);
+          destroyExecutorHandle(removed);
+        }
+        if (previousTarget !== executorTargetSize) {
+          appendLog(`executor pool size set to ${executorTargetSize}`);
+        }
       }
 
       function refreshBatterySnapshot(manager) {
@@ -1040,120 +1302,16 @@ self.onmessage = async (event) => {
 
       function executeScript(code, args, timeoutMs, resultBudgetBytes) {
         return new Promise((resolve) => {
-          const MAX_TIMER_MS = 2147483647;
-          const blob = new Blob([EXECUTOR_SOURCE], { type: "application/javascript" });
-          const runnerUrl = URL.createObjectURL(blob);
-          const runner = new Worker(runnerUrl);
-          const timeoutEnabled = Number.isInteger(timeoutMs) && timeoutMs > 0;
-          let settled = false;
-          let timeout = null;
-          let timeoutDeadlineMs = null;
-          const finish = (value) => {
-            if (settled) {
-              return;
-            }
-            settled = true;
-            if (timeout !== null) {
-              clearTimeout(timeout);
-            }
-            runner.terminate();
-            URL.revokeObjectURL(runnerUrl);
-            resolve(value);
-          };
-          const onTimeout = () => {
-            finish({
-              ok: false,
-              exitCode: 124,
-              durationMs: timeoutMs,
-              returnType: "none",
-              returnValue: null,
-              argsType: args === null ? "null" : Array.isArray(args) ? "array" : typeof args,
-              logs: [],
-              output: {
-                text: "",
-                truncated: false,
-                bytes: 0,
-              },
-              error: {
-                message: "Execution timeout exceeded",
-                stack: null,
-              },
-              notes: [],
-            });
-          };
-          const scheduleLongTimeout = () => {
-            if (settled || timeoutDeadlineMs === null) {
-              return;
-            }
-            const remainingMs = timeoutDeadlineMs - Date.now();
-            if (remainingMs <= 0) {
-              onTimeout();
-              return;
-            }
-            timeout = setTimeout(scheduleLongTimeout, Math.min(remainingMs, MAX_TIMER_MS));
-          };
-          if (timeoutEnabled) {
-            timeoutDeadlineMs = Date.now() + timeoutMs;
-            scheduleLongTimeout();
-          }
-
-          runner.addEventListener("message", (event) => {
-            const message = event.data || {};
-            if (message.__cluster_exec_done__ !== true) {
-              return;
-            }
-            if (Object.prototype.hasOwnProperty.call(message, "result")) {
-              finish(message.result);
-              return;
-            }
-            finish({
-              ok: false,
-              exitCode: 70,
-              durationMs: 0,
-              returnType: "none",
-              returnValue: null,
-              argsType: args === null ? "null" : Array.isArray(args) ? "array" : typeof args,
-              logs: [],
-              output: {
-                text: "",
-                truncated: false,
-                bytes: 0,
-              },
-              error: {
-                message: "Execution worker returned malformed response",
-                stack: null,
-              },
-              notes: [],
-            });
-          });
-
-          runner.addEventListener("error", () => {
-            finish({
-              ok: false,
-              exitCode: 70,
-              durationMs: 0,
-              returnType: "none",
-              returnValue: null,
-              argsType: args === null ? "null" : Array.isArray(args) ? "array" : typeof args,
-              logs: [],
-              output: {
-                text: "",
-                truncated: false,
-                bytes: 0,
-              },
-              error: {
-                message: "Execution worker crashed",
-                stack: null,
-              },
-              notes: [],
-            });
-          });
-
-          runner.postMessage({
+          syncExecutorPoolSize();
+          executorQueue.push({
             code,
             args,
+            timeoutMs,
             resultBudgetBytes,
+            resolve,
+            timeoutState: null,
           });
+          dispatchExecutorQueue();
         });
       }
 
@@ -1357,6 +1515,15 @@ self.onmessage = async (event) => {
         }
         if (capabilitiesTimer) {
           clearInterval(capabilitiesTimer);
+        }
+        for (const handle of executorPool) {
+          destroyExecutorHandle(handle);
+        }
+        executorPool = [];
+        executorQueue = [];
+        if (executorRunnerUrl) {
+          URL.revokeObjectURL(executorRunnerUrl);
+          executorRunnerUrl = null;
         }
       });
     </script>

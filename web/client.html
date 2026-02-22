@@ -354,6 +354,9 @@
         </div>
         <p class="line">Auth status: <strong id="authStatus" class="warn-text">not checked</strong></p>
         <p class="line">Workers connected: <strong id="workerCount">0</strong></p>
+        <div class="guide-link-row">
+          <a id="openMetricsPageLink" class="mono" href="#" target="_blank" rel="noopener">Open Metrics Dashboard</a>
+        </div>
       </div>
 
       <div class="card stack">
@@ -507,7 +510,13 @@ return hits;</pre>
             <strong>Live Raytrace (Cluster Progressive)</strong>
             <div class="script-options-row raytrace-grid">
               <div class="setting-cell">
-                <label class="setting-label" for="rayScenePreset">Scene</label>
+                <label class="setting-label" for="rayScenePreset">
+                  Scene
+                  <span class="tip-wrap">
+                    <button class="tip-trigger" type="button" aria-label="What is scene preset?">?</button>
+                    <span class="tip-popup">Chooses geometry/material layout. More complex scenes increase compute cost per sample.</span>
+                  </span>
+                </label>
                 <select id="rayScenePreset">
                   <option value="studio">Studio Spheres</option>
                   <option value="orb-garden">Orb Garden</option>
@@ -517,27 +526,63 @@ return hits;</pre>
                 </select>
               </div>
               <div class="setting-cell">
-                <label class="setting-label" for="rayWidth">Width</label>
+                <label class="setting-label" for="rayWidth">
+                  Width
+                  <span class="tip-wrap">
+                    <button class="tip-trigger" type="button" aria-label="What is render width?">?</button>
+                    <span class="tip-popup">Output image width in pixels. Higher width means more tiles and more total work.</span>
+                  </span>
+                </label>
                 <input id="rayWidth" type="number" min="64" step="1" value="320" />
               </div>
               <div class="setting-cell">
-                <label class="setting-label" for="rayHeight">Height</label>
+                <label class="setting-label" for="rayHeight">
+                  Height
+                  <span class="tip-wrap">
+                    <button class="tip-trigger" type="button" aria-label="What is render height?">?</button>
+                    <span class="tip-popup">Output image height in pixels. Total rays scale with width x height.</span>
+                  </span>
+                </label>
                 <input id="rayHeight" type="number" min="64" step="1" value="180" />
               </div>
               <div class="setting-cell">
-                <label class="setting-label" for="rayTileSize">Tile</label>
+                <label class="setting-label" for="rayTileSize">
+                  Tile
+                  <span class="tip-wrap">
+                    <button class="tip-trigger" type="button" aria-label="What is tile size?">?</button>
+                    <span class="tip-popup">Tile width/height in pixels per tile job unit. Smaller tiles improve balancing; larger tiles reduce scheduling overhead.</span>
+                  </span>
+                </label>
                 <input id="rayTileSize" type="number" min="4" step="1" value="20" />
               </div>
               <div class="setting-cell">
-                <label class="setting-label" for="raySamplesPerShard">SPP / Shard</label>
+                <label class="setting-label" for="raySamplesPerShard">
+                  SPP / Shard
+                  <span class="tip-wrap">
+                    <button class="tip-trigger" type="button" aria-label="What is samples per pixel per shard?">?</button>
+                    <span class="tip-popup">Samples per pixel each shard contributes to its tile. Higher values reduce noise but increase shard runtime.</span>
+                  </span>
+                </label>
                 <input id="raySamplesPerShard" type="number" min="1" step="1" value="2" />
               </div>
               <div class="setting-cell">
-                <label class="setting-label" for="rayPasses">Passes</label>
+                <label class="setting-label" for="rayPasses">
+                  Passes
+                  <span class="tip-wrap">
+                    <button class="tip-trigger" type="button" aria-label="What is pass count?">?</button>
+                    <span class="tip-popup">How many refinement rounds across all tiles. More passes progressively clean up noise.</span>
+                  </span>
+                </label>
                 <input id="rayPasses" type="number" min="1" step="1" value="20" />
               </div>
               <div class="setting-cell">
-                <label class="setting-label" for="rayMaxBounces">Bounces</label>
+                <label class="setting-label" for="rayMaxBounces">
+                  Bounces
+                  <span class="tip-wrap">
+                    <button class="tip-trigger" type="button" aria-label="What is max bounces?">?</button>
+                    <span class="tip-popup">Max path-tracing bounce depth. Higher bounces improve indirect lighting realism but cost much more CPU.</span>
+                  </span>
+                </label>
                 <input id="rayMaxBounces" type="number" min="1" step="1" value="3" />
               </div>
             </div>
@@ -608,6 +653,7 @@ return hits;</pre>
       const toggleParallelGuideBtnEl = document.getElementById("toggleParallelGuideBtn");
       const parallelGuidePanelEl = document.getElementById("parallelGuidePanel");
       const openGuidePageLinkEl = document.getElementById("openGuidePageLink");
+      const openMetricsPageLinkEl = document.getElementById("openMetricsPageLink");
       const submitScriptBtn = document.getElementById("submitScriptBtn");
       const rayScenePresetEl = document.getElementById("rayScenePreset");
       const rayWidthEl = document.getElementById("rayWidth");
@@ -1856,6 +1902,7 @@ return {
         });
       }
       openGuidePageLinkEl.href = withBase("/parallel-guide.html");
+      openMetricsPageLinkEl.href = withBase("/metrics.html");
       openRaytraceViewerLinkEl.href = raytraceViewerUrl(null);
       activeRaytraceSceneKey = sceneKeyFromSettings(getRaytraceSettings());
       updateRaytraceViewerLink();

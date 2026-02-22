@@ -1329,6 +1329,140 @@ function createStore(options = {}) {
     }));
   }
 
+  function summarizeVisibleJob(job) {
+    if (!job || job.hidden) {
+      return null;
+    }
+    const task = job.task && typeof job.task === "object" ? job.task : {};
+    const summary = {
+      jobId: job.jobId,
+      status: job.status,
+      controlState: job.controlState || "running",
+      op: typeof task.op === "string" ? task.op : "unknown",
+      executionModel: job.executionModel || "single",
+      assignedWorkerId: job.assignedWorkerId || null,
+      createdAt: job.createdAt || null,
+      updatedAt: job.updatedAt || null,
+    };
+    if (summary.op === "run_js") {
+      summary.timeoutMs = Number.isInteger(task.timeoutMs) ? task.timeoutMs : 0;
+      if (summary.executionModel === "sharded") {
+        summary.totalShards = Number(job.totalShards || 0);
+        summary.completedShards = Number(job.completedShards || 0);
+        summary.failedShards = Number(job.failedShards || 0);
+      }
+    } else if (summary.op === "add") {
+      summary.a = Number(task.a);
+      summary.b = Number(task.b);
+    }
+    return summary;
+  }
+
+  function listVisibleJobs(limit = 100) {
+    const safeLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 500) : 100;
+    const rows = [];
+    for (const job of jobs.values()) {
+      if (!job || job.hidden) {
+        continue;
+      }
+      const summarized = summarizeVisibleJob(job);
+      if (summarized) {
+        rows.push(summarized);
+      }
+    }
+    rows.sort((a, b) => {
+      const aTime = Date.parse(a.updatedAt || a.createdAt || 0) || 0;
+      const bTime = Date.parse(b.updatedAt || b.createdAt || 0) || 0;
+      return bTime - aTime;
+    });
+    return rows.slice(0, safeLimit);
+  }
+
+  function getActiveWorkerShardContexts(limitPerWorker = 2) {
+    const safeLimitPerWorker =
+      Number.isInteger(limitPerWorker) && limitPerWorker > 0 ? Math.min(limitPerWorker, 8) : 2;
+    const byWorker = {};
+    for (const job of jobs.values()) {
+      if (!job || !job.hidden || !job.parentJobId || job.status !== "running" || !job.assignedWorkerId) {
+        continue;
+      }
+      if (!job.shardContextBase || typeof job.shardContextBase !== "object") {
+        continue;
+      }
+      const workerId = job.assignedWorkerId;
+      const list = byWorker[workerId] || [];
+      if (list.length >= safeLimitPerWorker) {
+        continue;
+      }
+      list.push({
+        jobId: job.jobId,
+        parentJobId: job.parentJobId,
+        shardIndex: Number.isInteger(job.shardIndex) ? job.shardIndex : null,
+        totalShards: Number.isInteger(job.totalShards) ? job.totalShards : null,
+        attempt: Number.isInteger(job.attempt) ? job.attempt : 0,
+        context: job.shardContextBase,
+      });
+      byWorker[workerId] = list;
+    }
+    return byWorker;
+  }
+
+  function getRuntimeSnapshot(limitVisibleJobs = 120) {
+    const counters = {
+      totalJobs: 0,
+      visibleJobs: 0,
+      hiddenJobs: 0,
+      queued: 0,
+      running: 0,
+      done: 0,
+      failed: 0,
+      pausedParents: 0,
+      cancelledParents: 0,
+      hiddenQueued: 0,
+      hiddenRunning: 0,
+    };
+    for (const job of jobs.values()) {
+      if (!job) {
+        continue;
+      }
+      counters.totalJobs += 1;
+      if (job.hidden) {
+        counters.hiddenJobs += 1;
+      } else {
+        counters.visibleJobs += 1;
+      }
+      if (job.status === "queued") {
+        counters.queued += 1;
+      } else if (job.status === "running") {
+        counters.running += 1;
+      } else if (job.status === "done") {
+        counters.done += 1;
+      } else if (job.status === "failed") {
+        counters.failed += 1;
+      }
+      if (job.hidden && job.status === "queued") {
+        counters.hiddenQueued += 1;
+      }
+      if (job.hidden && job.status === "running") {
+        counters.hiddenRunning += 1;
+      }
+      if (!job.hidden && job.executionModel === "sharded" && job.controlState === "paused") {
+        counters.pausedParents += 1;
+      }
+      if (!job.hidden && job.executionModel === "sharded" && job.controlState === "cancelled") {
+        counters.cancelledParents += 1;
+      }
+    }
+    return {
+      now: nowIso(),
+      queueDepth: queue.length,
+      activeAssignments: assignments.size,
+      counters,
+      jobs: listVisibleJobs(limitVisibleJobs),
+      activeWorkerShardContexts: getActiveWorkerShardContexts(3),
+    };
+  }
+
   function getWorkerMetricsSnapshot(targetWorkerId = null) {
     const nowMs = Date.now();
     const allWorkerIds = new Set([...workerStats.keys(), ...workers.keys()]);
@@ -1443,6 +1577,9 @@ function createStore(options = {}) {
     failJob,
     removeWorkerSocket,
     listWorkers,
+    listVisibleJobs,
+    getRuntimeSnapshot,
+    getActiveWorkerShardContexts,
     getWorkerMetricsSnapshot,
     getJobEvents,
     maxCustomResultBytes,

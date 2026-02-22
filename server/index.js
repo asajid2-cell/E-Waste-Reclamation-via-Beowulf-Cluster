@@ -83,6 +83,7 @@ const WS_WORKER_PATH = withBasePath("/ws/worker");
 const CLIENT_PATH = withBasePath("/client");
 const WORKER_PATH = withBasePath("/worker");
 const RAYTRACE_VIEWER_PATH = withBasePath("/raytrace-viewer");
+const METRICS_PATH = withBasePath("/metrics");
 const SHORT_INVITE_PATH = withBasePath("/j");
 const PHRASE_INVITE_PATH = withBasePath("/p");
 const APP_ROOT_PATH = BASE_PATH || "/";
@@ -334,6 +335,14 @@ app.get(withBasePath("/raytrace-viewer.html"), (_req, res) => {
   res.sendFile(path.join(__dirname, "..", "web", "raytrace-viewer.html"));
 });
 
+app.get(METRICS_PATH, (_req, res) => {
+  res.sendFile(path.join(__dirname, "..", "web", "metrics.html"));
+});
+
+app.get(withBasePath("/metrics.html"), (_req, res) => {
+  res.sendFile(path.join(__dirname, "..", "web", "metrics.html"));
+});
+
 app.get(withBasePath("/j/:code"), (req, res) => {
   pruneExpiredShortInvites();
   const code = String(req.params.code || "").toLowerCase();
@@ -578,6 +587,14 @@ app.get(withBasePath("/api/jobs/:jobId/events"), auth.requireClientAuth, (req, r
 app.get(withBasePath("/api/workers"), auth.requireClientAuth, (_req, res) => {
   const workers = store.listWorkers();
   return res.json({ count: workers.length, workers });
+});
+
+app.get(withBasePath("/api/metrics/cluster"), auth.requireClientAuth, (_req, res) => {
+  return res.json({
+    now: new Date().toISOString(),
+    workers: store.getWorkerMetricsSnapshot(null),
+    runtime: store.getRuntimeSnapshot(160),
+  });
 });
 
 app.get(withBasePath("/api/worker/metrics"), (req, res) => {
