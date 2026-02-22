@@ -6,6 +6,9 @@ const DEFAULT_MAX_CUSTOM_RESULT_BYTES = 64 * 1024;
 const DEFAULT_MAX_SHARD_ATTEMPTS = 3;
 const DEFAULT_MAX_WORKER_SLOTS = 8;
 const DEFAULT_JOB_EVENT_BUFFER_SIZE = 4000;
+const DEFAULT_JOB_EVENT_BUFFER_MAX_BYTES = 32 * 1024 * 1024;
+const DEFAULT_JOB_EVENT_MAX_BYTES = 512 * 1024;
+const DEFAULT_HIDDEN_JOB_RESULT_MAX_BYTES = 8 * 1024;
 
 function isValidInputNumber(value) {
   return Number.isInteger(value) && value >= MIN_VALUE && value <= MAX_VALUE;
@@ -131,6 +134,10 @@ function createStore(options = {}) {
   const maxJobEventBufferSize = Number.isInteger(options.maxJobEventBufferSize) && options.maxJobEventBufferSize > 0
     ? options.maxJobEventBufferSize
     : DEFAULT_JOB_EVENT_BUFFER_SIZE;
+  const maxJobEventBufferBytes =
+    Number.isInteger(options.maxJobEventBufferBytes) && options.maxJobEventBufferBytes > 0
+      ? options.maxJobEventBufferBytes
+      : DEFAULT_JOB_EVENT_BUFFER_MAX_BYTES;
 
   const jobs = new Map();
   const queue = [];
@@ -268,9 +275,46 @@ function createStore(options = {}) {
     const created = {
       nextSeq: 1,
       events: [],
+      bytes: 0,
     };
     jobEventBuffers.set(jobId, created);
     return created;
+  }
+
+  function estimateObjectBytes(value, fallback = 256) {
+    try {
+      return Buffer.byteLength(JSON.stringify(value), "utf8");
+    } catch (_error) {
+      return fallback;
+    }
+  }
+
+  function buildLightweightEventPayload(payload) {
+    if (!payload || typeof payload !== "object") {
+      return payload;
+    }
+    const trimmed = { ...payload, payloadTruncated: true };
+    if (Object.prototype.hasOwnProperty.call(trimmed, "result")) {
+      const result = trimmed.result;
+      if (result && typeof result === "object" && !Array.isArray(result)) {
+        trimmed.result = {
+          mode: result.mode || null,
+          scenePreset: result.scenePreset || null,
+          width: Number.isFinite(Number(result.width)) ? Number(result.width) : null,
+          height: Number.isFinite(Number(result.height)) ? Number(result.height) : null,
+          tileX: Number.isFinite(Number(result.tileX)) ? Number(result.tileX) : null,
+          tileY: Number.isFinite(Number(result.tileY)) ? Number(result.tileY) : null,
+          tileW: Number.isFinite(Number(result.tileW)) ? Number(result.tileW) : null,
+          tileH: Number.isFinite(Number(result.tileH)) ? Number(result.tileH) : null,
+          passIndex: Number.isFinite(Number(result.passIndex)) ? Number(result.passIndex) : null,
+          samplesPerPixel: Number.isFinite(Number(result.samplesPerPixel)) ? Number(result.samplesPerPixel) : null,
+          samplesDone: Number.isFinite(Number(result.samplesDone)) ? Number(result.samplesDone) : null,
+        };
+      } else {
+        delete trimmed.result;
+      }
+    }
+    return trimmed;
   }
 
   function appendJobEvent(jobId, payload) {
@@ -278,15 +322,31 @@ function createStore(options = {}) {
       return null;
     }
     const buffer = ensureJobEventBuffer(jobId);
-    const event = {
+    let event = {
       seq: buffer.nextSeq,
       ts: nowIso(),
       ...payload,
     };
+    let eventBytes = estimateObjectBytes(event);
+    if (eventBytes > DEFAULT_JOB_EVENT_MAX_BYTES) {
+      event = {
+        seq: buffer.nextSeq,
+        ts: nowIso(),
+        ...buildLightweightEventPayload(payload),
+      };
+      eventBytes = estimateObjectBytes(event);
+    }
+    event.__bytes = eventBytes;
     buffer.nextSeq += 1;
     buffer.events.push(event);
+    buffer.bytes += eventBytes;
     while (buffer.events.length > maxJobEventBufferSize) {
-      buffer.events.shift();
+      const removed = buffer.events.shift();
+      buffer.bytes = Math.max(0, buffer.bytes - Number(removed && removed.__bytes ? removed.__bytes : 0));
+    }
+    while (buffer.bytes > maxJobEventBufferBytes && buffer.events.length > 1) {
+      const removed = buffer.events.shift();
+      buffer.bytes = Math.max(0, buffer.bytes - Number(removed && removed.__bytes ? removed.__bytes : 0));
     }
     return event;
   }
@@ -298,7 +358,13 @@ function createStore(options = {}) {
     const buffer = ensureJobEventBuffer(jobId);
     const firstSeq = buffer.events.length > 0 ? buffer.events[0].seq : buffer.nextSeq;
     const startIndex = Math.max(0, after - firstSeq + 1);
-    const events = buffer.events.slice(startIndex, startIndex + safeLimit);
+    const events = buffer.events.slice(startIndex, startIndex + safeLimit).map((event) => {
+      if (!event || typeof event !== "object") {
+        return event;
+      }
+      const { __bytes, ...rest } = event;
+      return rest;
+    });
     const hasMore = startIndex + events.length < buffer.events.length;
     const droppedBeforeSeq = after + 1 < firstSeq ? firstSeq - (after + 1) : 0;
     return {
@@ -507,6 +573,56 @@ function createStore(options = {}) {
     }
   }
 
+  function forEachChildJob(parentJobId, callback) {
+    for (const childJob of jobs.values()) {
+      if (childJob && childJob.parentJobId === parentJobId) {
+        callback(childJob);
+      }
+    }
+  }
+
+  function summarizeHiddenJobResult(result) {
+    if (result === null || result === undefined) {
+      return result;
+    }
+    const bytes = estimateObjectBytes(result, 0);
+    if (bytes <= DEFAULT_HIDDEN_JOB_RESULT_MAX_BYTES) {
+      return result;
+    }
+    const summary = {
+      truncated: true,
+      approxBytes: bytes,
+    };
+    if (result && typeof result === "object" && !Array.isArray(result)) {
+      if (Object.prototype.hasOwnProperty.call(result, "ok")) {
+        summary.ok = Boolean(result.ok);
+      }
+      if (Object.prototype.hasOwnProperty.call(result, "exitCode")) {
+        summary.exitCode = Number(result.exitCode);
+      }
+      if (Object.prototype.hasOwnProperty.call(result, "durationMs")) {
+        summary.durationMs = Number(result.durationMs);
+      }
+      if (result.returnValue && typeof result.returnValue === "object" && !Array.isArray(result.returnValue)) {
+        const rv = result.returnValue;
+        summary.returnValue = {
+          mode: rv.mode || null,
+          scenePreset: rv.scenePreset || null,
+          width: Number.isFinite(Number(rv.width)) ? Number(rv.width) : null,
+          height: Number.isFinite(Number(rv.height)) ? Number(rv.height) : null,
+          tileX: Number.isFinite(Number(rv.tileX)) ? Number(rv.tileX) : null,
+          tileY: Number.isFinite(Number(rv.tileY)) ? Number(rv.tileY) : null,
+          tileW: Number.isFinite(Number(rv.tileW)) ? Number(rv.tileW) : null,
+          tileH: Number.isFinite(Number(rv.tileH)) ? Number(rv.tileH) : null,
+          passIndex: Number.isFinite(Number(rv.passIndex)) ? Number(rv.passIndex) : null,
+          samplesPerPixel: Number.isFinite(Number(rv.samplesPerPixel)) ? Number(rv.samplesPerPixel) : null,
+          samplesDone: Number.isFinite(Number(rv.samplesDone)) ? Number(rv.samplesDone) : null,
+        };
+      }
+    }
+    return summary;
+  }
+
   function createShardedRunJsJob(task) {
     const shardConfig = task.shardConfig;
     const reducer = task.reducer;
@@ -523,7 +639,7 @@ function createStore(options = {}) {
       aggregate: initializeReducerAggregate(reducer),
       completedShards: 0,
       failedShards: 0,
-      childJobIds: [],
+      childJobIds: null,
     });
 
     let remainingUnits = shardConfig.totalUnits;
@@ -543,7 +659,6 @@ function createStore(options = {}) {
         maxAttempts: task.shardMaxAttempts || DEFAULT_MAX_SHARD_ATTEMPTS,
         shardIndex,
         totalShards,
-        sourceCode: task.code,
         shardContextBase: {
           parentJobId: parentJob.jobId,
           shardId: shardIndex,
@@ -553,7 +668,6 @@ function createStore(options = {}) {
           offset,
         },
       });
-      parentJob.childJobIds.push(childJob.jobId);
       remainingUnits -= units;
       offset += units;
     }
@@ -666,6 +780,13 @@ function createStore(options = {}) {
     job.error = reason || "cancelled";
     job.assignedWorkerId = null;
     job.assignedAtMs = null;
+    if (job.hidden && job.task && typeof job.task === "object") {
+      job.task.code = "";
+      job.task.args = null;
+      job.sourceCode = null;
+      job.shardContextBase = null;
+      job.result = null;
+    }
     touchJob(job);
     return true;
   }
@@ -730,20 +851,16 @@ function createStore(options = {}) {
     job.controlState = "cancelled";
     touchJob(job);
 
-    if ((job.executionModel || "single") === "sharded" && Array.isArray(job.childJobIds)) {
-      for (const childJobId of job.childJobIds) {
-        const child = jobs.get(childJobId);
-        if (!child) {
-          continue;
-        }
-        removeFromQueue(childJobId);
+    if ((job.executionModel || "single") === "sharded") {
+      forEachChildJob(job.jobId, (child) => {
+        removeFromQueue(child.jobId);
         cancelAssignedJob(child, "parent_cancelled");
         if (child.status !== "done" && child.status !== "failed") {
           child.status = "failed";
           child.error = "parent_cancelled";
           touchJob(child);
         }
-      }
+      });
       appendJobEvent(job.jobId, {
         type: "job_cancelled",
         jobId: job.jobId,
@@ -907,13 +1024,20 @@ function createStore(options = {}) {
     if (!worker || getWorkerAvailableSlots(worker) <= 0) {
       return false;
     }
-    if (job.parentJobId && job.sourceCode && job.shardContextBase) {
+    if (job.parentJobId && job.shardContextBase) {
+      const parentJob = jobs.get(job.parentJobId);
+      const sourceCode =
+        (typeof job.sourceCode === "string" && job.sourceCode.length > 0 && job.sourceCode) ||
+        (parentJob && parentJob.task && typeof parentJob.task.code === "string" ? parentJob.task.code : null);
+      if (!sourceCode) {
+        return false;
+      }
       const nextAttempt = job.attempt + 1;
       const shardContext = {
         ...job.shardContextBase,
         attempt: nextAttempt,
       };
-      job.task.code = buildShardInjectedCode(job.sourceCode, shardContext);
+      job.task.code = buildShardInjectedCode(sourceCode, shardContext);
     }
     job.status = "running";
     job.assignedWorkerId = workerId;
@@ -944,20 +1068,13 @@ function createStore(options = {}) {
       });
     }
 
-    if (!Array.isArray(parentJob.childJobIds)) {
-      return;
-    }
-    for (const childJobId of parentJob.childJobIds) {
-      const childJob = jobs.get(childJobId);
-      if (!childJob) {
-        continue;
-      }
+    forEachChildJob(parentJob.jobId, (childJob) => {
       if (childJob.status === "queued") {
         childJob.status = "failed";
         childJob.error = "parent_failed";
         touchJob(childJob);
       }
-    }
+    });
   }
 
   function finishJob(workerId, jobId, result) {
@@ -1001,8 +1118,10 @@ function createStore(options = {}) {
       refreshWorkerState(worker);
       return { ok: true, ignored: true };
     }
+    const eventResult = normalizeResultForLiveEvent(normalizedResult);
+    const shouldCleanupHiddenMemory = Boolean(job.hidden);
     job.status = "done";
-    job.result = normalizedResult;
+    job.result = job.hidden ? summarizeHiddenJobResult(normalizedResult) : normalizedResult;
     job.error = null;
     job.assignedWorkerId = workerId;
     job.assignedAtMs = null;
@@ -1038,7 +1157,7 @@ function createStore(options = {}) {
         completedShards: Number(parentJob.completedShards || 0),
         failedShards: Number(parentJob.failedShards || 0),
         shardContext: job.shardContextBase || null,
-        result: normalizeResultForLiveEvent(normalizedResult),
+        result: eventResult,
       });
       if (parentJob.completedShards >= parentJob.totalShards) {
         const finalResult = {
@@ -1076,6 +1195,13 @@ function createStore(options = {}) {
         });
       }
       touchJob(parentJob);
+    }
+
+    if (shouldCleanupHiddenMemory && job.task && typeof job.task === "object") {
+      job.task.code = "";
+      job.task.args = null;
+      job.sourceCode = null;
+      job.shardContextBase = null;
     }
 
     return { ok: true };
@@ -1140,6 +1266,14 @@ function createStore(options = {}) {
           `Shard ${job.shardIndex} failed after ${job.attempt}/${job.maxAttempts} attempts: ${error}`,
         );
       }
+    }
+
+    if (job.hidden && job.task && typeof job.task === "object") {
+      job.task.code = "";
+      job.task.args = null;
+      job.sourceCode = null;
+      job.shardContextBase = null;
+      job.result = null;
     }
 
     return { ok: true };

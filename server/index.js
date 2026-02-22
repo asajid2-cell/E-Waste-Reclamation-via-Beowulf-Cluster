@@ -40,6 +40,7 @@ const SHARD_MAX_PER_WORKER = Math.max(parsePositiveInt(process.env.SHARD_MAX_PER
 const SHARD_ABSOLUTE_MAX = Math.max(parsePositiveInt(process.env.SHARD_ABSOLUTE_MAX, Number.MAX_SAFE_INTEGER), 100);
 const WORKER_MAX_CONCURRENT_JOBS = Math.max(parsePositiveInt(process.env.WORKER_MAX_CONCURRENT_JOBS, 8), 1);
 const JOB_EVENT_BUFFER_SIZE = Math.max(parsePositiveInt(process.env.JOB_EVENT_BUFFER_SIZE, 4000), 100);
+const JOB_EVENT_BUFFER_MAX_BYTES = Math.max(parsePositiveInt(process.env.JOB_EVENT_BUFFER_MAX_BYTES, 32 * 1024 * 1024), 1024 * 1024);
 
 function normalizeBasePath(input) {
   if (!input || input === "/") {
@@ -94,6 +95,7 @@ const store = createStore({
   maxCustomResultBytes: config.customJobMaxResultBytes,
   maxWorkerSlots: WORKER_MAX_CONCURRENT_JOBS,
   maxJobEventBufferSize: JOB_EVENT_BUFFER_SIZE,
+  maxJobEventBufferBytes: JOB_EVENT_BUFFER_MAX_BYTES,
 });
 const dispatcher = createDispatcher(store, auth, console);
 const shortInvites = new Map();

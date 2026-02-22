@@ -366,6 +366,21 @@
         totalSamples += Number(payload.samplesDone || tileW * tileH * spp) || 0;
       }
 
+      function applyShardResultPayload(payload) {
+        if (!payload || typeof payload !== "object") {
+          return;
+        }
+        if (payload.mode === "raytrace_tile_v1") {
+          applyTilePayload(payload);
+          return;
+        }
+        if (payload.mode === "raytrace_tiles_v1" && Array.isArray(payload.tiles)) {
+          for (const tile of payload.tiles) {
+            applyTilePayload(tile);
+          }
+        }
+      }
+
       function updateStats() {
         eventCountEl.textContent = String(eventsSeen);
         completedShardsEl.textContent = String(completedShards);
@@ -380,7 +395,7 @@
         eventsSeen += 1;
         if (evt.type === "shard_done") {
           completedShards = Math.max(completedShards, Number(evt.completedShards || completedShards));
-          applyTilePayload(evt.result);
+          applyShardResultPayload(evt.result);
         } else if (evt.type === "job_done") {
           completedShards = Math.max(completedShards, Number(evt.completedShards || completedShards));
           setStatus("done", "ok");

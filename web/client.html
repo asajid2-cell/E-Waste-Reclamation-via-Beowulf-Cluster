@@ -526,7 +526,7 @@ return hits;</pre>
               </div>
               <div class="setting-cell">
                 <label class="setting-label" for="rayTileSize">Tile</label>
-                <input id="rayTileSize" type="number" min="4" step="1" value="16" />
+                <input id="rayTileSize" type="number" min="4" step="1" value="20" />
               </div>
               <div class="setting-cell">
                 <label class="setting-label" for="raySamplesPerShard">SPP / Shard</label>
@@ -534,7 +534,7 @@ return hits;</pre>
               </div>
               <div class="setting-cell">
                 <label class="setting-label" for="rayPasses">Passes</label>
-                <input id="rayPasses" type="number" min="1" step="1" value="40" />
+                <input id="rayPasses" type="number" min="1" step="1" value="20" />
               </div>
               <div class="setting-cell">
                 <label class="setting-label" for="rayMaxBounces">Bounces</label>
@@ -742,16 +742,14 @@ const height = Math.max(64, Math.min(1080, Number(cfg.height) || 180)) | 0;
 const tileSize = Math.max(4, Math.min(128, Number(cfg.tileSize) || 16)) | 0;
 const spp = Math.max(1, Math.min(128, Number(cfg.samplesPerShard) || 2)) | 0;
 const maxBounces = Math.max(1, Math.min(8, Number(cfg.maxBounces) || 3)) | 0;
-const shardOrdinal = Math.max(0, Math.floor(Number.isFinite(Number(brain.offset)) ? Number(brain.offset) : Number(brain.shardId || 0)));
+const units = Math.max(1, Math.floor(Number(brain.units) || 1));
+const shardOffset = Math.max(
+  0,
+  Math.floor(Number.isFinite(Number(brain.offset)) ? Number(brain.offset) : Number(brain.shardId || 0)),
+);
 const tilesX = Math.ceil(width / tileSize);
 const tilesY = Math.ceil(height / tileSize);
 const totalTiles = Math.max(1, tilesX * tilesY);
-const tileIndex = shardOrdinal % totalTiles;
-const passIndex = Math.floor(shardOrdinal / totalTiles);
-const tileX = (tileIndex % tilesX) * tileSize;
-const tileY = Math.floor(tileIndex / tilesX) * tileSize;
-const tileW = Math.min(tileSize, width - tileX);
-const tileH = Math.min(tileSize, height - tileY);
 
 function makeRng(seed) {
   let s = (seed >>> 0) || 1;
@@ -1063,57 +1061,98 @@ const invH = 1 / height;
 const aspect = width / height;
 const scale = Math.tan(fov * 0.5);
 
-const rgb8Sums = new Array(tileW * tileH * 3).fill(0);
-for (let py = 0; py < tileH; py += 1) {
-  for (let px = 0; px < tileW; px += 1) {
-    const gx = tileX + px;
-    const gy = tileY + py;
-    let sR = 0, sG = 0, sB = 0;
-    for (let s = 0; s < spp; s += 1) {
-      const seed =
-        ((passIndex + 1) * 73856093) ^
-        ((gx + 1) * 19349663) ^
-        ((gy + 1) * 83492791) ^
-        ((s + 17) * 2654435761);
-      const rng = makeRng(seed >>> 0);
-      const jx = (gx + rng()) * invW;
-      const jy = (gy + rng()) * invH;
-      const sx = (2 * jx - 1) * aspect * scale;
-      const sy = (1 - 2 * jy) * scale;
-      const dir = normalize(
-        forward[0] + right[0] * sx + up[0] * sy,
-        forward[1] + right[1] * sx + up[1] * sy,
-        forward[2] + right[2] * sx + up[2] * sy,
-      );
-      const c = trace([camPos[0], camPos[1], camPos[2]], dir, rng, maxBounces);
-      const gR = Math.pow(Math.max(0, Math.min(1, c[0])), 1 / 2.2);
-      const gG = Math.pow(Math.max(0, Math.min(1, c[1])), 1 / 2.2);
-      const gB = Math.pow(Math.max(0, Math.min(1, c[2])), 1 / 2.2);
-      sR += Math.round(gR * 255);
-      sG += Math.round(gG * 255);
-      sB += Math.round(gB * 255);
-    }
-    const off = (py * tileW + px) * 3;
-    rgb8Sums[off] = sR;
-    rgb8Sums[off + 1] = sG;
-    rgb8Sums[off + 2] = sB;
+function renderTileForOrdinal(shardOrdinal) {
+  const tileIndex = shardOrdinal % totalTiles;
+  const passIndex = Math.floor(shardOrdinal / totalTiles);
+  const tileX = (tileIndex % tilesX) * tileSize;
+  const tileY = Math.floor(tileIndex / tilesX) * tileSize;
+  const tileW = Math.min(tileSize, width - tileX);
+  const tileH = Math.min(tileSize, height - tileY);
+  if (tileW <= 0 || tileH <= 0) {
+    return null;
   }
+
+  const rgb8Sums = new Array(tileW * tileH * 3).fill(0);
+  for (let py = 0; py < tileH; py += 1) {
+    for (let px = 0; px < tileW; px += 1) {
+      const gx = tileX + px;
+      const gy = tileY + py;
+      let sR = 0, sG = 0, sB = 0;
+      for (let s = 0; s < spp; s += 1) {
+        const seed =
+          ((passIndex + 1) * 73856093) ^
+          ((gx + 1) * 19349663) ^
+          ((gy + 1) * 83492791) ^
+          ((s + 17) * 2654435761);
+        const rng = makeRng(seed >>> 0);
+        const jx = (gx + rng()) * invW;
+        const jy = (gy + rng()) * invH;
+        const sx = (2 * jx - 1) * aspect * scale;
+        const sy = (1 - 2 * jy) * scale;
+        const dir = normalize(
+          forward[0] + right[0] * sx + up[0] * sy,
+          forward[1] + right[1] * sx + up[1] * sy,
+          forward[2] + right[2] * sx + up[2] * sy,
+        );
+        const c = trace([camPos[0], camPos[1], camPos[2]], dir, rng, maxBounces);
+        const gR = Math.pow(Math.max(0, Math.min(1, c[0])), 1 / 2.2);
+        const gG = Math.pow(Math.max(0, Math.min(1, c[1])), 1 / 2.2);
+        const gB = Math.pow(Math.max(0, Math.min(1, c[2])), 1 / 2.2);
+        sR += Math.round(gR * 255);
+        sG += Math.round(gG * 255);
+        sB += Math.round(gB * 255);
+      }
+      const off = (py * tileW + px) * 3;
+      rgb8Sums[off] = sR;
+      rgb8Sums[off + 1] = sG;
+      rgb8Sums[off + 2] = sB;
+    }
+  }
+
+  return {
+    mode: "raytrace_tile_v1",
+    scenePreset,
+    width,
+    height,
+    tileX,
+    tileY,
+    tileW,
+    tileH,
+    passIndex,
+    samplesPerPixel: spp,
+    rgb8Sums,
+    samplesDone: tileW * tileH * spp,
+  };
+}
+
+const tiles = [];
+let samplesDone = 0;
+for (let unitIndex = 0; unitIndex < units; unitIndex += 1) {
+  const ordinal = shardOffset + unitIndex;
+  const tile = renderTileForOrdinal(ordinal);
+  if (!tile) {
+    continue;
+  }
+  tiles.push(tile);
+  samplesDone += Number(tile.samplesDone) || 0;
+}
+
+if (tiles.length === 1) {
+  return {
+    ...tiles[0],
+    shardsDone: 1,
+    samplesDone,
+  };
 }
 
 return {
-  mode: "raytrace_tile_v1",
+  mode: "raytrace_tiles_v1",
   scenePreset,
   width,
   height,
-  tileX,
-  tileY,
-  tileW,
-  tileH,
-  passIndex,
-  samplesPerPixel: spp,
-  rgb8Sums,
-  shardsDone: 1,
-  samplesDone: tileW * tileH * spp,
+  tiles,
+  shardsDone: tiles.length,
+  samplesDone,
 };`;
       }
 
@@ -1594,13 +1633,18 @@ return {
         const tilesX = Math.ceil(settings.width / settings.tileSize);
         const tilesY = Math.ceil(settings.height / settings.tileSize);
         const totalShards = Math.max(1, tilesX * tilesY * settings.passes);
+        const effectiveWorkers = Math.max(2, workerCount || 0);
+        const targetShardsPerWorker = 140;
+        const targetShardCount = Math.max(1, effectiveWorkers * targetShardsPerWorker);
+        const unitsPerShard = Math.max(1, Math.ceil(totalShards / targetShardCount));
+        const plannedShardCount = Math.ceil(totalShards / unitsPerShard);
         const payload = {
           code: buildRaytraceScript(),
           args: settings,
           executionModel: "sharded",
           shardConfig: {
             totalUnits: totalShards,
-            unitsPerShard: 1,
+            unitsPerShard,
           },
           reducer: {
             type: "sum",
@@ -1613,6 +1657,8 @@ return {
         if (!created || !created.jobId) {
           return;
         }
+        raytraceHintEl.textContent = `Raytrace planned with ${plannedShardCount} shard job(s) across ${effectiveWorkers} worker(s).`;
+        raytraceHintEl.className = "hint mono ok";
         activeRaytraceSceneKey = sceneKey;
         rememberSceneJob(sceneKey, created.jobId);
         const viewerUrl = raytraceViewerUrl(created.jobId);
